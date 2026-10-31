@@ -8,6 +8,41 @@ try:
 except ImportError:
     _idna_uts46 = None
 
+# The one host rule every public-URL validator in this Skill applies after its own
+# URL parsing and UTS46 normalization (AnySearch, Firecrawl and the route checks).
+NON_PUBLIC_HOSTNAMES = frozenset({"localhost"})
+NON_PUBLIC_HOST_SUFFIXES = (".localhost", ".local", ".internal", ".lan", ".home", ".intranet")
+_HOST_LABEL_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
+_NUMERIC_LABEL_RE = re.compile(r"(?:0x[0-9a-f]+|[0-9]+)")
+
+
+def public_host_problem(host: str) -> str | None:
+    """Classify an already normalized host without DNS; ``None`` means public.
+
+    Problems: ``malformed``, ``non_public``, ``not_fully_qualified`` and
+    ``ambiguous_numeric``.
+    """
+
+    if not isinstance(host, str) or not host or len(host) > 253:
+        return "malformed"
+    if host in NON_PUBLIC_HOSTNAMES or host.endswith(NON_PUBLIC_HOST_SUFFIXES):
+        return "non_public"
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        address = None
+    if address is not None:
+        return None if address.is_global else "non_public"
+    labels = host.split(".")
+    if len(labels) < 2:
+        return "not_fully_qualified"
+    if all(_NUMERIC_LABEL_RE.fullmatch(label) for label in labels):
+        return "ambiguous_numeric"
+    if any(_HOST_LABEL_RE.fullmatch(label) is None for label in labels):
+        return "malformed"
+    return None
+
+
 def _normalize_host_uts46(raw_host: str) -> str | None:
     """Normalize one route host without legacy IDNA2003 target changes."""
 
@@ -83,23 +118,4 @@ def is_public_http_url(value: str) -> bool:
     host = _normalize_host_uts46(raw_host)
     if host is None:
         return False
-    if not host or len(host) > 253:
-        return False
-    if host == "localhost" or host.endswith(".localhost") or host.endswith(".local"):
-        return False
-    try:
-        address = ipaddress.ip_address(host)
-    except ValueError:
-        address = None
-    if address is not None:
-        return address.is_global
-    labels = host.split(".")
-    if len(labels) < 2 or host.endswith((".internal", ".lan", ".home", ".intranet")):
-        return False
-    if all(re.fullmatch(r"(?:0x[0-9a-f]+|[0-9]+)", label) for label in labels):
-        return False
-    return all(
-        re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label)
-        is not None
-        for label in labels
-    )
+    return public_host_problem(host) is None

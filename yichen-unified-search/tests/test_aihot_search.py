@@ -2,7 +2,9 @@ import importlib.util
 import pathlib
 import sys
 import unittest
+from argparse import Namespace
 from datetime import datetime, timezone
+from urllib.parse import parse_qs, urlsplit
 from urllib.request import Request
 
 
@@ -316,6 +318,219 @@ class AihotAdapterTests(unittest.TestCase):
                 limit=10,
                 retrieved_at="2026-07-31T01:00:00Z",
             )
+
+    def test_items_drop_rows_published_before_since(self):
+        payload = {
+            "items": [
+                {
+                    "title": "inside",
+                    "url": "https://example.com/inside",
+                    "publishedAt": "2026-07-31T00:00:00Z",
+                },
+                {
+                    "title": "too old",
+                    "url": "https://example.com/old",
+                    "publishedAt": "2026-07-29T23:59:59Z",
+                },
+                {"title": "no time", "url": "https://example.com/no-time"},
+            ]
+        }
+        result = ADAPTER.normalize_items(
+            payload,
+            query="AI news",
+            limit=20,
+            days=1,
+            feed="selected",
+            retrieved_at="2026-07-31T01:00:00Z",
+            since=datetime(2026, 7, 30, tzinfo=timezone.utc),
+        )
+        self.assertEqual(
+            [item["url"] for item in result["candidates"]],
+            ["https://example.com/inside", "https://example.com/no-time"],
+        )
+        self.assertEqual(result["routes"][0]["status"], "completed")
+        self.assertEqual(result["errors"], [])
+        coverage = result["coverage"][0]
+        self.assertEqual(coverage["outside_window_count"], 1)
+        self.assertEqual(coverage["time_unverified_count"], 1)
+        self.assertEqual(coverage["rejected_count"], 0)
+        self.assertEqual(result["request"]["time_range"]["since"], "2026-07-30T00:00:00Z")
+
+    def test_run_items_checks_the_same_since_it_requests(self):
+        now = datetime(2026, 7, 31, 12, 0, 0, 654321, tzinfo=timezone.utc)
+        requested = []
+
+        def fetch(url, timeout):
+            requested.append(url)
+            return {
+                "items": [
+                    {
+                        "title": "boundary",
+                        "url": "https://example.com/boundary",
+                        "publishedAt": "2026-07-30T12:00:00Z",
+                    },
+                    {
+                        "title": "one second early",
+                        "url": "https://example.com/early",
+                        "publishedAt": "2026-07-30T11:59:59Z",
+                    },
+                ]
+            }
+
+        args = Namespace(
+            keyword=[], feed="selected", days=1, limit=10,
+            category=None, timeout=20, query="AI news",
+        )
+        result = ADAPTER.run_items(args, now, fetch)
+        since = parse_qs(urlsplit(requested[0]).query)["since"][0]
+        self.assertEqual(since, "2026-07-30T12:00:00Z")
+        self.assertEqual(
+            [item["url"] for item in result["candidates"]],
+            ["https://example.com/boundary"],
+        )
+        self.assertEqual(result["coverage"][0]["outside_window_count"], 1)
+
+    def _paged_fetch(self, pages):
+        requested = []
+
+        def fetch(url, timeout):
+            requested.append(url)
+            return pages[len(requested) - 1]
+
+        return fetch, requested
+
+    def _page(self, index, has_next, cursor):
+        return {
+            "items": [{
+                "title": f"item {index}",
+                "url": f"https://example.com/item-{index}",
+                "publishedAt": "2026-07-31T11:00:00Z",
+            }],
+            "hasNext": has_next,
+            "nextCursor": cursor,
+        }
+
+    def test_max_pages_follows_opaque_cursor_until_has_next_is_false(self):
+        now = datetime(2026, 7, 31, 12, 0, tzinfo=timezone.utc)
+        fetch, requested = self._paged_fetch([
+            self._page(1, True, "opaque+/=token"),
+            self._page(2, True, "second"),
+            self._page(3, False, None),
+        ])
+        args = Namespace(keyword=[], feed="selected", days=7, limit=300, category=None,
+                         timeout=20, query="AI news", max_pages=5)
+        result = ADAPTER.run_items(args, now, fetch)
+        self.assertEqual(len(requested), 3)
+        self.assertNotIn("cursor", parse_qs(urlsplit(requested[0]).query))
+        self.assertEqual(parse_qs(urlsplit(requested[1]).query)["cursor"], ["opaque+/=token"])
+        self.assertEqual(parse_qs(urlsplit(requested[2]).query)["cursor"], ["second"])
+        self.assertEqual(parse_qs(urlsplit(requested[0]).query)["take"], ["100"])
+        self.assertEqual(len(result["candidates"]), 3)
+        self.assertEqual(result["coverage"][0]["pages_fetched"], 3)
+        self.assertFalse(result["coverage"][0]["truncated"])
+
+    def test_max_pages_cap_reports_truncation(self):
+        now = datetime(2026, 7, 31, 12, 0, tzinfo=timezone.utc)
+        fetch, requested = self._paged_fetch([
+            self._page(1, True, "a"),
+            self._page(2, True, "b"),
+        ])
+        args = Namespace(keyword=[], feed="selected", days=7, limit=200, category=None,
+                         timeout=20, query="AI news", max_pages=2)
+        result = ADAPTER.run_items(args, now, fetch)
+        self.assertEqual(len(requested), 2)
+        self.assertEqual(result["coverage"][0]["pages_fetched"], 2)
+        self.assertTrue(result["coverage"][0]["truncated"])
+
+    def test_single_page_default_never_requests_a_cursor(self):
+        now = datetime(2026, 7, 31, 12, 0, tzinfo=timezone.utc)
+        fetch, requested = self._paged_fetch([self._page(1, True, "ignored")])
+        args = Namespace(keyword=[], feed="selected", days=1, limit=10, category=None,
+                         timeout=20, query="AI news")
+        result = ADAPTER.run_items(args, now, fetch)
+        self.assertEqual(len(requested), 1)
+        self.assertTrue(result["coverage"][0]["truncated"])
+        self.assertNotIn("pages_fetched", result["coverage"][0])
+
+    def test_cli_rejects_paging_for_daily_and_scales_limit_with_pages(self):
+        import subprocess
+        script = str(ROOT / "scripts" / "aihot_search.py")
+        daily = subprocess.run([sys.executable, script, "--query", "q", "--feed", "daily",
+                                "--max-pages", "2"], capture_output=True, text=True)
+        self.assertEqual(daily.returncode, 2)
+        self.assertIn("--max-pages", daily.stderr)
+        too_many = subprocess.run([sys.executable, script, "--query", "q", "--limit", "201",
+                                   "--max-pages", "2"], capture_output=True, text=True)
+        self.assertEqual(too_many.returncode, 2)
+        self.assertIn("between 1 and 200", too_many.stderr)
+
+    def test_unknown_category_is_kept_and_counted(self):
+        payload = {
+            "items": [
+                {
+                    "title": "new section",
+                    "url": "https://example.com/agents",
+                    "category": "ai-agents",
+                },
+                {
+                    "title": "numeric category",
+                    "url": "https://example.com/numeric",
+                    "category": 7,
+                },
+                {
+                    "title": "known",
+                    "url": "https://example.com/known",
+                    "category": "paper",
+                },
+            ]
+        }
+        result = ADAPTER.normalize_items(
+            payload,
+            query="AI news",
+            limit=20,
+            days=1,
+            feed="selected",
+            retrieved_at="2026-07-31T01:00:00Z",
+        )
+        self.assertEqual(result["routes"][0]["status"], "completed")
+        self.assertEqual(result["errors"], [])
+        self.assertEqual(len(result["candidates"]), 3)
+        first, second, third = result["candidates"]
+        self.assertEqual(first["platform_fields"]["aihot"]["category"], "unknown")
+        self.assertEqual(first["platform_fields"]["aihot"]["category_raw"], "ai-agents")
+        self.assertEqual(first["content_type"], "ai_news")
+        self.assertIn(ADAPTER.UNKNOWN_CATEGORY_LIMITATION, first["limitations"])
+        self.assertEqual(second["platform_fields"]["aihot"]["category"], "unknown")
+        self.assertIsNone(second["platform_fields"]["aihot"]["category_raw"])
+        self.assertEqual(third["content_type"], "ai_paper")
+        self.assertEqual(result["coverage"][0]["unknown_category_count"], 2)
+        self.assertEqual(result["coverage"][0]["rejected_count"], 0)
+
+    def test_daily_unknown_item_category_is_kept(self):
+        payload = {
+            "date": "2026-07-30",
+            "sections": [
+                {
+                    "label": "论文研究",
+                    "items": [
+                        {
+                            "title": "Agent paper",
+                            "sourceUrl": "https://example.com/agent-paper",
+                            "category": "agents",
+                        }
+                    ],
+                }
+            ],
+            "flashes": [],
+        }
+        result = ADAPTER.normalize_daily(
+            payload, query="AI 日报", limit=10, retrieved_at="2026-07-31T01:00:00Z"
+        )
+        self.assertEqual(result["routes"][0]["status"], "completed")
+        self.assertEqual(
+            result["candidates"][0]["platform_fields"]["aihot"]["category"], "unknown"
+        )
+        self.assertEqual(result["coverage"][0]["unknown_category_count"], 1)
 
     def test_items_url_contains_browser_api_parameters(self):
         url = ADAPTER.build_url(

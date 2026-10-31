@@ -4,6 +4,7 @@ import pathlib
 import sys
 import unittest
 from datetime import date
+from unittest import mock
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -96,14 +97,18 @@ class RouteTests(unittest.TestCase):
         self.assertIn("at most 10", " ".join(result["limitations"]))
 
     def test_zhihu_batch_uses_at_most_five_independent_search_calls(self):
-        queries = ("知乎 query 1", "query 2", "query 3", "query 4", "query 5")
+        queries = tuple(f"知乎 query {index}" for index in range(1, 6))
         result = ROUTER.plan(request(queries=queries, mode="batch"))
         self.assertEqual(result["status"], "ready")
         self.assertEqual(result["route"]["backend"], "zhihu-open-platform-cli")
         self.assertEqual(len(result["steps"]), 5)
+        # The standalone channel word is dropped; the search terms reach Zhihu unchanged.
         self.assertEqual(
             [option_value(step, "--query") for step in result["steps"]],
-            list(queries),
+            [f"query {index}" for index in range(1, 6)],
+        )
+        self.assertEqual(
+            [item["original_query"] for item in result["route"]["query_rewrites"]], list(queries)
         )
         self.assertTrue(
             all(step["subcommand"] == "search" for step in result["steps"])
@@ -342,9 +347,17 @@ class RouteTests(unittest.TestCase):
 
     def test_vertical_search_discovers_subdomains_first(self):
         result = ROUTER.plan(request(domain="legal"))
-        self.assertEqual(result["steps"][1]["subcommand"], "get_sub_domains")
-        self.assertEqual(result["steps"][2]["subcommand"], "search")
-        self.assertEqual(result["steps"][2]["action"], "invoke_existing_adapter")
+        discovery = result["steps"][0]
+        self.assertEqual(discovery["action"], "invoke_existing_adapter")
+        self.assertEqual(discovery["subcommand"], "sub-domains")
+        # A complete argv for the normalizing adapter; nothing is left for the agent to assemble.
+        self.assertEqual(
+            discovery["argv"],
+            ["python3", ROUTER.ANYSEARCH_ADAPTER, "sub-domains", "--domain", "legal"],
+        )
+        self.assertEqual(result["steps"][1]["subcommand"], "search")
+        self.assertEqual(result["steps"][1]["action"], "invoke_existing_adapter")
+        self.assertEqual(len(result["steps"]), 2)
 
     def test_vertical_batch_discovers_subdomains_and_preserves_scope(self):
         result = ROUTER.plan(
@@ -354,9 +367,9 @@ class RouteTests(unittest.TestCase):
                 domain="legal",
             )
         )
-        self.assertEqual(result["steps"][1]["subcommand"], "get_sub_domains")
-        self.assertEqual(result["steps"][2]["subcommand"], "batch")
-        payload = json.loads(option_value(result["steps"][2], "--queries"))
+        self.assertEqual(result["steps"][0]["subcommand"], "sub-domains")
+        self.assertEqual(result["steps"][1]["subcommand"], "batch")
+        payload = json.loads(option_value(result["steps"][1], "--queries"))
         self.assertEqual(
             [item["query"] for item in payload],
             ["contract damages", "arbitration award"],
@@ -372,9 +385,9 @@ class RouteTests(unittest.TestCase):
         result = ROUTER.plan(
             request(queries=("query one", "query two"), domain="legal")
         )
-        self.assertEqual(result["steps"][1]["subcommand"], "get_sub_domains")
-        self.assertEqual(result["steps"][2]["subcommand"], "batch")
-        payload = json.loads(option_value(result["steps"][2], "--queries"))
+        self.assertEqual(result["steps"][0]["subcommand"], "sub-domains")
+        self.assertEqual(result["steps"][1]["subcommand"], "batch")
+        payload = json.loads(option_value(result["steps"][1], "--queries"))
         self.assertTrue(all(item["domain"] == "legal" for item in payload))
 
     def test_hybrid_requires_vertical_domain(self):
@@ -395,8 +408,8 @@ class RouteTests(unittest.TestCase):
         result = ROUTER.plan(request(domain="legal", hybrid=True))
         self.assertEqual(result["status"], "ready")
         self.assertEqual(result["route"]["reason"], "public_web_general_plus_vertical")
-        self.assertEqual(result["steps"][1]["subcommand"], "get_sub_domains")
-        payload = json.loads(option_value(result["steps"][2], "--queries"))
+        self.assertEqual(result["steps"][0]["subcommand"], "sub-domains")
+        payload = json.loads(option_value(result["steps"][1], "--queries"))
         self.assertEqual(len(payload), 2)
         self.assertNotIn("domain", payload[0])
         self.assertEqual(payload[1]["domain"], "legal")
@@ -492,6 +505,74 @@ class RouteTests(unittest.TestCase):
         result = ROUTER.plan(request(platform="xiaohongshu", days=30))
         self.assertEqual(result["status"], "invalid_request")
         self.assertEqual(result["steps"], [])
+
+    def test_xiaohongshu_and_douyin_argv_use_opencli_days_windows(self):
+        for platform, query in (("douyin", "数字人分身 实测"), ("xiaohongshu", "AI 编程 教程")):
+            with self.subTest(platform=platform):
+                result = ROUTER.plan(request(platform=platform, queries=(query,)))
+                self.assertEqual(
+                    result["steps"][0]["argv"],
+                    ["opencli", platform, "search", query, "--days", "1", "--content", "all",
+                     "--limit", "10", "--enrich", "--window", "background",
+                     "--site-session", "ephemeral", "--keep-tab", "false", "-f", "yaml"],
+                )
+                self.assertEqual(result["steps"][0]["execution"]["minimum_gap_seconds_after_step"], 5)
+
+    def test_toutiao_month_window_does_not_touch_browser_mappings(self):
+        # Regression: building every platform's argv eagerly raised KeyError for --days 30.
+        result = ROUTER.plan(request(platform="toutiao", days=30))
+        self.assertEqual(result["status"], "ready")
+        self.assertEqual(option_value(result["steps"][0], "--days"), "30")
+
+    def test_opencli_profile_is_a_global_option_before_the_site(self):
+        result = ROUTER.plan(request(platform="douyin", opencli_profile="chrome-main"))
+        self.assertEqual(result["steps"][0]["argv"][:5],
+                         ["opencli", "--profile", "chrome-main", "douyin", "search"])
+        self.assertTrue(any("--profile chrome-main" in item for item in result["limitations"]))
+
+    def test_invalid_opencli_profile_is_rejected_offline(self):
+        for profile in ("", "../chrome", "two words", "a" * 65, "--window"):
+            with self.subTest(profile=profile):
+                result = ROUTER.plan(request(platform="douyin", opencli_profile=profile))
+                self.assertEqual(result["status"], "invalid_request")
+                self.assertEqual(result["steps"], [])
+
+    def test_browser_search_limitations_expose_defaults_and_stop_rule(self):
+        # 2026-10-12: the default 1-day window was invisible, and three Douyin attempts
+        # were spent on the same adapter failure.
+        for platform in ("douyin", "xiaohongshu"):
+            with self.subTest(platform=platform):
+                joined = "\n".join(ROUTER.plan(request(platform=platform))["limitations"])
+                self.assertIn("1-day window", joined)
+                self.assertIn("0 (no time limit)", joined)
+                self.assertIn("--opencli-profile", joined)
+                self.assertIn("adapter_failure", joined)
+                self.assertIn("do not retry with other keywords", joined)
+                explicit = "\n".join(ROUTER.plan(request(platform=platform, days=7))["limitations"])
+                self.assertNotIn("1-day window", explicit)
+
+    def test_profile_flag_is_reported_as_ignored_elsewhere(self):
+        result = ROUTER.plan(request(platform="web", opencli_profile="chrome-main"))
+        self.assertEqual(result["status"], "ready")
+        self.assertTrue(any("ignored for this route" in item for item in result["limitations"]))
+
+    def test_cli_parses_opencli_profile(self):
+        argv = ["route_search.py", "--query", "数字人口播 复盘", "--platform", "douyin",
+                "--days", "180", "--opencli-profile", "chrome-main"]
+        with mock.patch.object(sys, "argv", argv):
+            parsed = ROUTER.parse_args()
+        self.assertEqual(parsed.opencli_profile, "chrome-main")
+        step = ROUTER.plan(parsed)["steps"][0]
+        self.assertEqual(step["argv"][:3], ["opencli", "--profile", "chrome-main"])
+        self.assertEqual(option_value(step, "--days"), "180")
+
+    def test_invalid_browser_search_days_are_rejected_offline(self):
+        for platform, days in (("douyin", 30), ("douyin", -1), ("xiaohongshu", 30), ("xiaohongshu", 3651)):
+            with self.subTest(platform=platform, days=days):
+                result = ROUTER.plan(request(platform=platform, days=days))
+                self.assertEqual(result["status"], "invalid_request")
+                self.assertIn(f"{platform} --days", result["reason"])
+                self.assertEqual(result["steps"], [])
 
     def test_invalid_toutiao_days_is_rejected_offline(self):
         result = ROUTER.plan(request(platform="toutiao", days=180))
@@ -811,6 +892,8 @@ class RouteTests(unittest.TestCase):
                 "public",
                 "--limit",
                 "1",
+                "--json",
+                ROUTER.GITHUB_REPO_JSON_FIELDS,
                 "--",
                 "--visibility=private",
             ],
@@ -818,6 +901,29 @@ class RouteTests(unittest.TestCase):
         self.assertEqual(result["authorization"], "not_required")
         self.assertTrue(result["route"]["login_state_used"])
         self.assertIn("--visibility public", " ".join(result["limitations"]))
+
+    def test_github_requests_json_rows_with_urls_so_zero_results_are_visible(self):
+        # Live 2026-10-31: plain-text gh printed nothing for a zero-result search, the
+        # same as a silent failure, and its rows had no URL.
+        # Fields listed by `gh search repos --help` in gh 2.88.1.
+        gh_fields = {
+            "createdAt", "defaultBranch", "description", "forksCount", "fullName", "hasDownloads",
+            "hasIssues", "hasPages", "hasProjects", "hasWiki", "homepage", "id", "isArchived",
+            "isDisabled", "isFork", "isPrivate", "language", "license", "name", "openIssuesCount",
+            "owner", "pushedAt", "size", "stargazersCount", "updatedAt", "url", "visibility",
+            "watchersCount",
+        }
+        result = ROUTER.plan(request(platform="github", queries=("free-threaded python",), limit=3))
+        argv = result["steps"][0]["argv"]
+        fields = option_value(result["steps"][0], "--json").split(",")
+        self.assertTrue(set(fields) <= gh_fields, set(fields) - gh_fields)
+        self.assertIn("url", fields)
+        self.assertIn("fullName", fields)
+        self.assertEqual(argv[-2:], ["--", "free-threaded python"])
+        self.assertLess(argv.index("--json"), argv.index("--"))
+        joined = " ".join(result["limitations"])
+        self.assertIn("[] is a true zero-result search", joined)
+        self.assertIn("empty stdout", joined)
 
     def test_private_data_is_blocked(self):
         result = ROUTER.plan(request(private_data=True))
@@ -1025,6 +1131,313 @@ class RouteTests(unittest.TestCase):
                 self.assertTrue(
                     raw_subcommands.isdisjoint({"search", "batch_search", "extract"})
                 )
+
+
+NATIVE_PLATFORMS = ("x", "xiaohongshu", "youtube", "github", "wechat", "bilibili", "toutiao",
+                    "douyin", "xiaoyuzhou", "zhihu", "weibo", "aihot")
+
+
+class RouterHardeningTests(unittest.TestCase):
+    """Regressions for silently rerouted, ignored or option-injectable plans."""
+
+    def test_native_platforms_never_reroute_domain_or_hybrid_to_anysearch(self):
+        # 2026-10-31 review: --platform x --domain silently skipped the Grok-first X route.
+        for platform in NATIVE_PLATFORMS:
+            for options in ({"domain": "legal"}, {"domain": "legal", "hybrid": True},
+                            {"domain": "legal", "mode": "batch", "queries": ("one", "two")}):
+                with self.subTest(platform=platform, options=options):
+                    result = ROUTER.plan(request(platform=platform, login_approved=True, **options))
+                    self.assertEqual(result["status"], "invalid_request")
+                    self.assertEqual(result["steps"], [])
+                    self.assertIn("--platform web", result["reason"])
+
+    def test_auto_detected_platform_with_domain_names_the_detection(self):
+        result = ROUTER.plan(request(queries=("小红书上的 合同纠纷 经验",), domain="legal"))
+        self.assertEqual(result["status"], "invalid_request")
+        self.assertIn("xiaohongshu route detected by --platform auto", result["reason"])
+
+    def test_public_web_keeps_vertical_domain_routes(self):
+        for options in ({"platform": "web"}, {"platform": "auto", "mode": "batch", "queries": ("X 上的 合同", "two")}):
+            with self.subTest(options=options):
+                result = ROUTER.plan(request(domain="social_media", **options))
+                self.assertEqual(result["status"], "ready")
+                self.assertEqual(result["route"]["backend"], "anysearch")
+                self.assertEqual(result["steps"][0]["argv"][-2:], ["--domain", "social_media"])
+
+    def test_domain_must_be_a_plain_anysearch_vertical_name(self):
+        for domain in ("", "Legal", "1legal", "-legal", "legal;rm", "le gal", "legal/x", "a" * 42):
+            with self.subTest(domain=domain):
+                result = ROUTER.plan(request(platform="web", domain=domain))
+                self.assertEqual(result["status"], "invalid_request")
+                self.assertIn("--domain", result["reason"])
+                self.assertEqual(result["steps"], [])
+        for domain in ("legal", "social_media", "a" * 41):
+            with self.subTest(domain=domain):
+                self.assertEqual(ROUTER.plan(request(platform="web", domain=domain))["status"], "ready")
+
+    def test_vertical_routes_contain_no_raw_runtime_steps(self):
+        for options in ({}, {"hybrid": True}, {"mode": "batch", "queries": ("one", "two")}):
+            with self.subTest(options=options):
+                steps = ROUTER.plan(request(platform="web", domain="legal", **options))["steps"]
+                self.assertTrue(all(step["action"] == "invoke_existing_adapter" for step in steps))
+                self.assertTrue(all(step["argv"][:2] == ["python3", ROUTER.ANYSEARCH_ADAPTER] for step in steps))
+
+    def test_platforms_without_time_filter_report_ignored_days(self):
+        for platform in ("github", "bilibili", "wechat", "xiaoyuzhou"):
+            with self.subTest(platform=platform):
+                result = ROUTER.plan(request(platform=platform, days=7))
+                self.assertEqual(result["status"], "ready")
+                self.assertIn("--days 7 was not applied", " ".join(result["limitations"]))
+                self.assertNotIn("--days", result["steps"][0]["argv"])
+                unbounded = ROUTER.plan(request(platform=platform, days=0))
+                self.assertNotIn("was not applied", " ".join(unbounded["limitations"]))
+
+    def test_xiaoyuzhou_keeps_previously_collected_limitations(self):
+        result = ROUTER.plan(request(platform="xiaoyuzhou", input_kind="url-seed", days=30, limit=20,
+                                     queries=("引用 https://example.com/report 的播客",)))
+        joined = " ".join(result["limitations"])
+        self.assertIn("discovery seed", joined)
+        self.assertIn("--days 30 was not applied", joined)
+        self.assertIn("not Xiaoyuzhou's complete native index", joined)
+        self.assertIn("clamps max_results to 10", joined)
+
+    def test_native_days_bounds_come_from_the_capability_table(self):
+        for platform, valid, invalid in (("youtube", 3650, 3651), ("toutiao", 30, 31),
+                                         ("xiaohongshu", 180, 30), ("douyin", 180, 30)):
+            with self.subTest(platform=platform):
+                self.assertEqual(ROUTER.plan(request(platform=platform, days=valid))["status"], "ready")
+                rejected = ROUTER.plan(request(platform=platform, days=invalid))
+                self.assertEqual(rejected["status"], "invalid_request")
+                self.assertIn(f"{platform} --days", rejected["reason"])
+
+    def test_batch_site_index_does_not_apply_native_day_buckets(self):
+        # Batch goes through AnySearch site: search, so Douyin's publish_time buckets do not apply.
+        result = ROUTER.plan(request(platform="douyin", mode="batch", queries=("one", "two"), days=30))
+        self.assertEqual(result["status"], "ready")
+        self.assertIn("does not translate --days", " ".join(result["limitations"]))
+
+    def test_x_quick_query_count_stays_within_default_research_budget(self):
+        limit = ROUTER.X_QUICK_MAX_QUERIES
+        self.assertEqual(limit, ROUTER.X_RESEARCH_DEFAULT_MAX_SEARCHES)
+        allowed = ROUTER.plan(request(platform="x", queries=tuple(f"topic {i}" for i in range(limit))))
+        self.assertEqual(allowed["status"], "ready")
+        self.assertEqual(len(allowed["steps"]), limit)
+        duplicated = ROUTER.plan(request(platform="x", queries=tuple(f"topic {i % limit}" for i in range(45))))
+        self.assertEqual(len(duplicated["steps"]), limit)
+        too_many = ROUTER.plan(request(platform="x", queries=tuple(f"topic {i}" for i in range(45))))
+        self.assertEqual(too_many["status"], "invalid_request")
+        self.assertIn(f"at most {limit}", too_many["reason"])
+        self.assertIn("--depth research", too_many["reason"])
+        self.assertEqual(too_many["steps"], [])
+        batch = ROUTER.plan(request(platform="x", mode="batch", queries=tuple(f"topic {i}" for i in range(12))))
+        self.assertEqual(batch["status"], "ready")
+
+    def test_gated_research_waves_point_to_their_real_step_key(self):
+        queries = tuple(f"focused query {index}" for index in range(1, 13))
+        result = ROUTER.plan(request(platform="x", depth="research", queries=queries,
+                                     target_results=20, max_searches=12))
+        for wave in result["research"]["initial_waves"][1:]:
+            self.assertIn(wave["execute_from"], wave)
+            self.assertEqual(len(wave[wave["execute_from"]]), wave["step_count"])
+
+    def test_dash_leading_queries_are_parsed_as_values_by_python_adapters(self):
+        import aihot_search
+        import anysearch_adapter
+        import grok_x_result_adapter
+        import youtube_search
+        import zhihu_adapter
+
+        query = "--limit=99 -h"
+        web = ROUTER.plan(request(platform="web", queries=(query,)))
+        parsed = {
+            "anysearch": anysearch_adapter.build_parser().parse_args(web["steps"][0]["argv"][2:]).query,
+            "youtube": youtube_search.parse_args(
+                ROUTER.plan(request(platform="youtube", queries=(query,)))["steps"][0]["argv"][2:]).query,
+            "zhihu": zhihu_adapter.parse_args(
+                ROUTER.plan(request(platform="zhihu", queries=(query,)))["steps"][0]["argv"][2:]).query,
+            "grok_normalizer": grok_x_result_adapter.build_parser().parse_args(
+                ROUTER.plan(request(platform="x", queries=(query,)))["steps"][0]["result_normalizer"]["argv"][2:]).query,
+        }
+        for adapter, value in parsed.items():
+            with self.subTest(adapter=adapter):
+                self.assertEqual(value, query)
+        aihot_argv = ROUTER.plan(request(platform="aihot", queries=("-今天 AI 新闻",)))["steps"][0]["argv"]
+        with mock.patch.object(sys, "argv", ["aihot_search.py", *aihot_argv[2:]]):
+            self.assertEqual(aihot_search.parse_args().query, "-今天 AI 新闻")
+        channel = ROUTER.plan(request(platform="youtube", mode="channel", queries=("-channel",)))
+        self.assertEqual(youtube_search.parse_args(channel["steps"][0]["argv"][2:]).channel, "-channel")
+
+    def test_dash_leading_queries_follow_the_option_terminator_for_external_clis(self):
+        query = "--limit=99 -h"
+        for platform in ("github", "wechat", "toutiao", "bilibili", "xiaohongshu", "douyin"):
+            with self.subTest(platform=platform):
+                argv = ROUTER.plan(request(platform=platform, queries=(query,), opencli_profile="chrome-main"))["steps"][0]["argv"]
+                self.assertEqual(argv[-2:], ["--", query])
+                self.assertEqual(argv.count(query), 1)
+
+    def test_ordinary_queries_keep_documented_argv_shapes(self):
+        self.assertEqual(ROUTER.plan(request(platform="web"))["steps"][0]["argv"][2:],
+                         ["search", "agent memory best practices", "--max-results", "10"])
+        self.assertEqual(ROUTER.plan(request(platform="toutiao"))["steps"][0]["argv"][:4],
+                         ["opencli", "toutiao", "search", "agent memory best practices"])
+
+    def test_weibo_rejects_queries_its_adapter_would_refuse(self):
+        for mode, queries in (("search", ("-iPhone",)), ("batch", ("iPhone", " --help"))):
+            with self.subTest(mode=mode):
+                result = ROUTER.plan(request(platform="weibo", mode=mode, queries=queries))
+                self.assertEqual(result["status"], "invalid_request")
+                self.assertEqual(result["steps"], [])
+
+    def test_x_wording_requires_a_standalone_channel_x(self):
+        for query in ("特斯拉 Model X 上市 最新消息", "iPhone X 中的 AI 功能", "Model  X 平台架构",
+                      "3x上涨 的 AI 概念股", "SpaceX 上的发射计划", "X 上线 新功能 的报道"):
+            with self.subTest(query=query):
+                self.assertNotIn("x", ROUTER.platform_hints(query))
+        for query in ("X 上最近的 AI 动态", "X平台 上的讨论", "X 中的热门帖子", "推特 上的 OpenAI", "x.com 上的讨论"):
+            with self.subTest(query=query):
+                self.assertEqual(ROUTER.platform_hints(query), ["x"])
+
+    def test_weibo_forwards_the_opencli_profile_to_its_adapter(self):
+        import weibo_adapter
+
+        weibo = ROUTER.plan(request(platform="weibo", queries=("iPhone 18",), opencli_profile="chrome-main"))
+        self.assertEqual(option_value(weibo["steps"][0], "--opencli-profile"), "chrome-main")
+        self.assertEqual(weibo_adapter.parse_args(weibo["steps"][0]["argv"][2:]).opencli_profile, "chrome-main")
+        joined = " ".join(weibo["limitations"])
+        self.assertIn("--profile chrome-main", joined)
+        self.assertNotIn("ignored for this route", joined)
+        without = ROUTER.plan(request(platform="weibo", queries=("iPhone 18",)))
+        self.assertNotIn("--opencli-profile", without["steps"][0]["argv"])
+
+    def test_site_map_uses_the_shared_public_host_rule(self):
+        for url in ("https://wiki.internal/docs/", "https://nas.lan/", "https://router.home/"):
+            with self.subTest(url=url):
+                result = ROUTER.plan(request(queries=(url,), platform="web", mode="site-map"))
+                self.assertEqual(result["status"], "invalid_request")
+        self.assertEqual(ROUTER.plan(request(queries=("https://example.com/docs/",), platform="web",
+                                             mode="site-map"))["status"], "ready")
+
+    def test_toutiao_reports_command_exec_as_adapter_failure(self):
+        joined = " ".join(ROUTER.plan(request(platform="toutiao"))["limitations"])
+        self.assertIn("COMMAND_EXEC", joined)
+        self.assertIn("adapter_failure", joined)
+
+
+def sent_values(step):
+    """What a step sends upstream: the Grok tool query, or the argv elements."""
+    if "arguments" in step:
+        return [step["arguments"]["query"]]
+    return step["argv"]
+
+
+class AutoChannelCueTests(unittest.TestCase):
+    """2026-10-31 live run: auto-routed native searches still carried the channel words."""
+
+    def test_live_weibo_cue_is_removed_and_both_queries_are_recorded(self):
+        # The live Weibo search for "微博上 iPhone 18 讨论" returned "微博发现页变红了"-style
+        # posts about Weibo itself; the cue-free query returned iPhone 18 discussion.
+        result = ROUTER.plan(request(queries=("微博上 iPhone 18 讨论",), limit=5))
+        self.assertEqual(result["route"]["platform"], "weibo")
+        self.assertEqual(option_value(result["steps"][0], "--query"), "iPhone 18 讨论")
+        self.assertEqual(result["route"]["query_rewrites"], [{
+            "query_index": 1, "original_query": "微博上 iPhone 18 讨论",
+            "query": "iPhone 18 讨论", "removed": ["微博上"],
+        }])
+        joined = " ".join(result["limitations"])
+        self.assertIn("'微博上 iPhone 18 讨论'", joined)
+        self.assertIn("sends 'iPhone 18 讨论'", joined)
+
+    def test_channel_words_are_removed_for_every_native_route(self):
+        for query, options, platform, sent in (
+            ("知乎上Python GIL讨论", {}, "zhihu", "Python GIL讨论"),
+            ("X上关于Gemini4的讨论", {}, "x", "关于Gemini4的讨论"),
+            ("B站 Gemini 4 评测视频", {}, "bilibili", "Gemini 4 评测视频"),
+            ("抖音上 Gemini 4", {}, "douyin", "Gemini 4"),
+            ("小红书上秋冬穿搭推荐", {}, "xiaohongshu", "秋冬穿搭推荐"),
+            ("free-threading projects on GitHub", {}, "github", "free-threading projects"),
+            ("在微博搜索财报", {}, "weibo", "财报"),
+            ("小宇宙上的 AI 播客", {}, "xiaoyuzhou", "site:xiaoyuzhoufm.com AI 播客"),
+        ):
+            with self.subTest(query=query):
+                result = ROUTER.plan(request(queries=(query,), **options))
+                self.assertEqual(result["status"], "ready")
+                self.assertEqual(result["route"]["platform"], platform)
+                values = sent_values(result["steps"][0])
+                self.assertIn(sent, values)
+                self.assertNotIn(query, values)
+                self.assertEqual(result["route"]["query_rewrites"][0]["original_query"], query)
+
+    def test_subject_wording_and_ambiguous_names_stay_in_the_query(self):
+        mixed = ROUTER.plan(request(queries=("在微博上搜微博公司财报",)))
+        self.assertEqual(option_value(mixed["steps"][0], "--query"), "微博公司财报")
+        self.assertEqual(mixed["route"]["query_rewrites"][0]["removed"], ["在微博上搜"])
+        for query, backend in (("微博公司财报", "anysearch"), ("微博上市时间", "anysearch"),
+                               ("latest Weibo posts about iPhone 18", "weibo-readonly-auto"),
+                               ("知乎上", "zhihu-open-platform-cli")):
+            with self.subTest(query=query):
+                result = ROUTER.plan(request(queries=(query,)))
+                self.assertEqual(result["route"]["backend"], backend)
+                self.assertIn(query, sent_values(result["steps"][0]))
+                self.assertNotIn("query_rewrites", result["route"])
+
+    def test_explicit_platform_and_public_web_routes_send_queries_verbatim(self):
+        explicit = ROUTER.plan(request(platform="weibo", queries=("微博上 iPhone 18 讨论",)))
+        self.assertEqual(option_value(explicit["steps"][0], "--query"), "微博上 iPhone 18 讨论")
+        self.assertNotIn("query_rewrites", explicit["route"])
+        web = ROUTER.plan(request(queries=("X 上的 OpenAI", "Twitter 上的 Anthropic"), mode="batch"))
+        payload = json.loads(option_value(web["steps"][0], "--queries"))
+        self.assertEqual([item["query"] for item in payload], ["X 上的 OpenAI", "Twitter 上的 Anthropic"])
+        self.assertNotIn("query_rewrites", web["route"])
+
+    def test_a_cue_is_never_stripped_into_an_option_like_query(self):
+        self.assertEqual(ROUTER.strip_channel_cues("微博上 -广告 iPhone", "weibo"),
+                         ("微博上 -广告 iPhone", []))
+
+
+class AutoMixedChannelTests(unittest.TestCase):
+    """2026-10-31 live run: one '知乎上' query decided the channel for the whole group."""
+
+    def routes_of(self, result):
+        return [item["route_platform"] for item in result["query_routes"]]
+
+    def test_search_mode_reports_each_querys_own_channel(self):
+        result = ROUTER.plan(request(queries=("知乎上Python GIL讨论", "iPhone X评测"), limit=5))
+        self.assertEqual(result["status"], "invalid_request")
+        self.assertEqual(result["steps"], [])
+        self.assertNotIn("requires exactly one", result["reason"])
+        self.assertIn("query 1: zhihu, query 2: web", result["reason"])
+        self.assertIn("--platform zhihu", result["reason"])
+        self.assertIn("--mode batch", result["reason"])
+        self.assertEqual(self.routes_of(result), ["zhihu", "web"])
+        self.assertEqual([item["query"] for item in result["query_routes"]],
+                         ["知乎上Python GIL讨论", "iPhone X评测"])
+        three = ROUTER.plan(request(queries=("今天AI圈有什么新闻", "知乎上Python GIL讨论", "iPhone X评测")))
+        self.assertEqual(self.routes_of(three), ["aihot", "zhihu", "web"])
+        x_group = ROUTER.plan(request(queries=("X 上的 Gemini 4 讨论", "Gemini 4 评测")))
+        self.assertEqual(self.routes_of(x_group), ["x", "web"])
+
+    def test_batch_mode_no_longer_sends_unlabeled_queries_to_zhihu(self):
+        # Live: the AI HOT query and "iPhone X评测" both became Zhihu searches.
+        queries = ("今天AI圈有什么新闻", "知乎上Python GIL讨论", "iPhone X评测")
+        result = ROUTER.plan(request(queries=queries, mode="batch", limit=5))
+        self.assertEqual(result["status"], "invalid_request")
+        self.assertEqual(result["steps"], [])
+        self.assertEqual(self.routes_of(result), ["web", "zhihu", "web"])
+        joined = " ".join(result["limitations"])
+        self.assertIn("Query 1, 3 names no platform", joined)
+        self.assertIn("--mode search", joined)
+
+    def test_queries_that_agree_on_one_channel_still_route(self):
+        labeled = ROUTER.plan(request(queries=("知乎上 Agent", "在知乎 RAG"), mode="batch"))
+        self.assertEqual(labeled["status"], "ready")
+        self.assertEqual([option_value(step, "--query") for step in labeled["steps"]], ["Agent", "RAG"])
+        search = ROUTER.plan(request(queries=("知乎上 Agent", "在知乎 RAG")))
+        self.assertEqual(search["status"], "invalid_request")
+        self.assertIn("use --mode batch", search["reason"])
+        unlabeled = ROUTER.plan(request(queries=("Agent 记忆", "RAG 工作流"), mode="batch"))
+        self.assertEqual(unlabeled["route"]["backend"], "anysearch")
+        explicit = ROUTER.plan(request(queries=("知乎上 Agent", "RAG"), platform="zhihu", mode="batch"))
+        self.assertEqual([option_value(step, "--query") for step in explicit["steps"]], ["知乎上 Agent", "RAG"])
 
 
 if __name__ == "__main__":

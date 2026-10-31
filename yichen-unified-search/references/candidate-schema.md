@@ -157,7 +157,7 @@ Grok `search_x_with_grok` 的文本结果必须先交给 `grok_x_result_adapter.
 }
 ```
 
-`unique_candidates` 是筛选和 `--limit` 前的去重数量；`eligible_before_limit` 是确定性筛选后的数量；`returned` 才是最终交付量。`filtered` 逐项记录淘汰原因，互动阈值对应字段缺失时也计入该阈值的淘汰数。该 coverage 只证明离线合并过程，不证明原文真实性、搜索穷尽性或缺失字段。
+`unique_candidates` 是筛选和 `--limit` 前的去重数量；`eligible_before_limit` 是确定性筛选后的数量；`returned` 才是最终交付量。`filtered` 逐项记录淘汰原因；作者、语言或互动阈值对应字段缺失时保留候选并标为未知，写入 `platform_fields.x_research_merge.unverified_filters` 并计入 `coverage.unknown_filter_fields`，只有已知值不满足才淘汰。合并 coverage 另记 `search_budget`（按不同 route `call_index` 计数，超过 40 次拒绝）、`failed_input_routes` 与 `partial_input_routes`；输入全部失败时合并 route 为 `failed`。该 coverage 只证明离线合并过程，不证明原文真实性、搜索穷尽性或缺失字段。
 
 ## 字段规则
 
@@ -181,10 +181,11 @@ Grok `search_x_with_grok` 的文本结果必须先交给 `grok_x_result_adapter.
 - 微博单查询最多 3 页/20 条，batch 最多 5 个独立调用且必须串行、步骤间至少间隔 5 秒。临时匿名访客会话只驻留当前进程内存；OpenCLI 浏览器回退只允许一次有界 `weibo search` 并直接管理现有 Chrome 会话。适配器不接收、输出或持久化 Cookie 值。coverage 必须记录实际后端、页数、拒绝/重复/时间未知/时间窗外数量及实际 `login_state_used`；`--days` 是有界返回页上的客户端过滤，不得描述成服务端日期检索或完整站内覆盖。
 - AnySearch `search/batch_search` 必须经 `anysearch_adapter.py` 归一化。只有上游明确返回 `Search Results (0 results, ...)` 时才允许 `status=completed` 且候选为空；非空输出无法解析、数量不符或批次缺段必须写 `parse_error`，并标记 `partial/failed`。
 - AnySearch 适配器为每个 search/batch candidate 写入 `provenance.anysearch_receipt`：版本、run ID、过期时间和 HMAC-SHA256 签名。默认有效 2 小时，并绑定 candidate ID、URL、query、检索时间和过期时间；它只证明候选来自近期适配器搜索，不证明正文事实。不得手工生成、复制到其他 URL 或移除后继续核验。
-- AnySearch `extract` 只能由适配器核验或轻量富化本次搜索 envelope 中已有且回执有效的完整 AnySearch candidate；正文写入 `platform_fields.anysearch.extract_markdown`，读取时间写入 `extract_retrieved_at`，并在 `provenance.verification` 保留原始查询、candidate ID、实际后端和检查时间。打开原文后写 `opened_original=true`，但仅打开页面不足以证明主张，`verification.status` 仍保持 `candidate`。不得把用户直接给出的 URL 临时塞入候选后调用。
+- AnySearch 候选 URL 是搜索引擎跳转包装链接（`google.com` 的 `/url`、`/goto`，`bing.com` 的 `/ck/a`，`baidu.com` 的 `/link`，含 `www.`）时，适配器保留候选、不改写 URL，并在候选 `limitations` 附 “This URL is a search-engine redirect wrapper; its destination, and whether it matches any site: scope in the query, is unknown until the page is opened.”。`site:` 路线（平台批量公共索引、小宇宙）里尤其常见；这类候选不能算作 `site:` 站点的命中，落点只有打开后才知道。
+- AnySearch `extract` 只能由适配器核验或轻量富化本次搜索 envelope 中已有且回执有效的完整 AnySearch candidate；正文写入 `platform_fields.anysearch.extract_markdown`，读取时间写入 `extract_retrieved_at`，并在 `provenance.verification` 保留原始查询、candidate ID、实际后端和检查时间。上游 extract 输出 `{"url","title","content"}` JSON 包装时（2026-10-31 实测即此形态），`extract_markdown` 只存解包后的 `content`，非空的 `title` 写入 `extract_title`，非空的 `url`（extract 报告的页面 URL，可用来判断跳转包装链接的落点）写入 `extract_url`；输出不是这种 JSON 时原样存入 `extract_markdown`，不写这两个字段。打开原文后写 `opened_original=true`，但仅打开页面不足以证明主张，`verification.status` 仍保持 `candidate`。整体输出或 JSON content 以 `extract_failed` 或 “Unable to extract content from the URL” 开头，读到反爬/验证/登录页时，或正文去空白后不足 200 个可见字符时，适配器分别返回 `extract_failed`、`blocked_or_verification`、`content_too_short` 失败 envelope（退出码 2），不得写 `opened_original=true`。抽取输出为 `{"url","title","content"}` JSON 时，拦截判断与字数只看 title/content，不计 JSON 包装。不得把用户直接给出的 URL 临时塞入候选后调用。
 - Firecrawl Map 只在显式 `site-map` 模式产生候选：`backend=firecrawl`、`query` 为种子 URL、`provenance.route_reason=explicit_site_map`、`provenance.map_seed_url` 保留种子。适配器只输出公共 HTTP(S)、与种子同源且路径位于种子范围内的链接；Map 没有读取正文，候选必须保持 `opened_original=false` 与 `verification.status=candidate`。
 - Firecrawl Scrape 不产生一个伪造的新搜索来源；它保留原 AnySearch candidate 的 `backend=anysearch` 与有效 `provenance.anysearch_receipt`，把 Markdown 写入 `platform_fields.firecrawl.scrape_markdown`、读取时间写入 `scrape_retrieved_at`，并在 `provenance.verification.backend=firecrawl` 记录实际核验后端。只打开页面仍保持 `verification.status=candidate`。
-- Firecrawl Scrape 固定 `formats=[markdown]`、`storeInCache=false`、`proxy=basic`、`skipTlsVerification=false`，不传 actions、页面 headers、cookies 或 `zeroDataRetention`。`storeInCache=false` 不得被描述为绝对零数据保留或已启用 ZDR。
+- Firecrawl Scrape 固定 `formats=[markdown]`、`storeInCache=false`、`proxy=basic`、`skipTlsVerification=false`，不传 actions、页面 headers、cookies 或 `zeroDataRetention`。`storeInCache=false` 不得被描述为绝对零数据保留或已启用 ZDR。Scrape 读到验证/登录页（含 metadata 标题与最终 URL 判断）记 `blocked_or_verification`，去空白且不计链接目标后不足 200 个可见字符记 `content_too_short`，两者都以退出码 2 结束且不写 `opened_original=true`。
 - `visibility`：只允许 `public/authenticated_public`；本 Skill 不产生 private 候选。
 - `coverage`：逐后端记录查询数、返回数、截断、时间筛选、登录态和已知索引限制；X 多查询合并另记录输入 envelope 数、输入/唯一/重复数量、未知类型状态、逐项筛除数和最终返回数。
 - `errors`：保存可公开的错误类别和影响；不得记录 Cookie、Token、Key、完整认证响应或敏感查询。
@@ -202,3 +203,11 @@ Grok `search_x_with_grok` 的文本结果必须先交给 `grok_x_result_adapter.
 - items/daily 的必要字段或公开 URL 校验失败记入 errors，coverage 保存 raw_result_count、rejected_count、duplicate_count；全部无效为 failed，部分无效为 partial，真正空列表为 completed。
 - 多主题分别请求并保留逐主题 routes/coverage；candidate.provenance.matched_topics 记录命中主题，coverage.selected_count 记录该主题最终被选入的候选数。最后一项 stage=merge 描述 URL 去重和全局 limit 截断，不能将其 query_count 与逐主题计数累加。
 - language 未由来源确定时为 null；中文聚合标题不能证明原文语言。URL 校验仅针对字面公共地址，不代表页面或事实已核验。
+
+## 本轮新增字段规则（2026-10-31）
+
+- YouTube 匿名 yt-dlp 路线的发布时间来自 `youtubetab:approximate_date` 的相对时间，写 `provenance.published_at_precision=approximate_relative_time`；带时间窗时因时间未知被丢弃的行计入 `coverage.time_filter.time_unknown_dropped`，大于 0 时 route 为 `partial`。
+- AI HOT 在本地核对 `published_at` 不早于 since：更早的条目丢弃并计 `outside_window_count`，没有时间的保留并计 `time_unverified_count`；上游新分类保留为 `category=unknown`，原值写 `category_raw` 并计 `unknown_category_count`。
+- FxTwitter 的 HTTP 404 或 API code 404 仍按空页处理，coverage 记 `empty_result_signal`（`http_404_treated_as_empty` / `api_code_404_treated_as_empty`），不能当成确定的零结果。
+- Grok 结果适配器只解析工具输出尾部的机器块；输出头的 partial 提示或 FxTwitter 回退输出被截断时 route 为 `partial`，coverage 记 `structured_matched_count`、`structured_missing_count`、`tool_output_truncated`；MCP `isError` 按真实类别记录并保留 `error_code`；`/i/status/` 链接的作者为 `null`。
+- 微博 `platform_fields.weibo.followers_count`：接口返回精确整数时原样保留；返回“1.2万”“3亿”这类展示值时换算成整数，并写 `followers_count_approximate: true`，表示是四舍五入后的展示数，不是精确粉丝数。

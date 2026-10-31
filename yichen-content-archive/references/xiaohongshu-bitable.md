@@ -27,7 +27,7 @@ $HOME/.config/agent-secrets/agent_secrets.py run --profile xiaohongshu -- <comma
 
 | 目标字段 | 来源 |
 |---|---|
-| 来源链接 | 原始笔记 URL |
+| 来源链接 | metadata 的 `source_url`（规范详情链接，已去掉 `xsec_token` 等查询参数） |
 | 平台 | 小红书 |
 | 作者 | `author` |
 | 发布日期 | `time` 转换后的日期 |
@@ -45,7 +45,7 @@ $HOME/.config/agent-secrets/agent_secrets.py run --profile xiaohongshu -- <comma
 | 目标字段 | 来源 |
 |---|---|
 | 主字段/标题 | `title` |
-| 来源链接 | 原始笔记 URL |
+| 来源链接 | metadata 的 `source_url`（规范详情链接，已去掉 `xsec_token` 等查询参数） |
 | 平台 | 小红书 |
 | 作者/日期 | `author` / `time` |
 | 一句话摘要 | `desc` 与图片内容的模型摘要 |
@@ -55,6 +55,8 @@ $HOME/.config/agent-secrets/agent_secrets.py run --profile xiaohongshu -- <comma
 ## 失败处理
 
 - `INITIAL_STATE` 不完整但 meta 可用：保留 `extraction_source=meta_fallback`，不得把单封面或摘要冒充完整笔记。
+- 媒体下载失败：脚本以退出码 2 结束并列出失败项，未完成的数据只留在 `.part` 临时文件里；只按已成功的本地文件写入，缺失的媒体相关字段留空并说明，不得把 `.part` 当作完整媒体。
+- metadata 里的媒体与字幕地址只保留主机和路径，不能直接下载；需要重新取媒体时重新运行脚本，不得从网页快照或日志里拼接签名直链。
 - 匿名失败：先报告具体缺口；只有当前目标获当轮授权后才注入 `XHS_COOKIE` 并加 `--use-cookie`。
 - 视频无字幕：只有用户要求转写时才调用 ASR；失败时保留原视频与错误原因，不跨服务商静默重提。
 - 飞书写入失败：报告状态码、错误码和缺失权限，不输出凭证值，不重复创建可能已经成功的记录。

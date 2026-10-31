@@ -1,0 +1,16 @@
+{
+  "status": "failed",
+  "chunks": 5,
+  "chunks_not_attempted": 3,
+  "chunks_transcribed": 1,
+  "stop_reason": "quota_exceeded",
+  "charge_free": false,
+  "failed_chunks": [
+    {
+      "index": 1,
+      "start_ms": 0,
+      "end_ms": 60000,
+      "error": "quota_exceeded (HTTP 402): the China-site account has no remaining quota; {\"error\":{\"type\":\"quota_exceeded\"}}"
+    }
+  ]
+}

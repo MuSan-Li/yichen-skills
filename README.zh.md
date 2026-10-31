@@ -30,7 +30,7 @@
 3. 从 macOS / Windows 微信本地聊天、朋友圈和收藏数据沉淀数字资产（`yichen-wechat-local-vault`）
 4. 抓取已知抖音链接的对标视频（`yichen-content-archive`）
 5. 抓取已知小红书链接的对标笔记（`yichen-content-archive`）
-6. 用火山 ASR 做转写、字幕和口播粗剪（`yichen-volc-asr`）
+6. 用随附的豆包/火山 ASR 后端做字幕和口播粗剪（`yichen-asr`）
 7. 通过 ChatGPT 官网完成可验证调研（`yichen-chatgpt-web-research`）
 8. 安装和维护 Markdown/Obsidian-first 的 Codex 记忆系统（`yichen-agent-memory`）
 9. 批量导出公众号历史文章、原创列表、正文，以及可选阅读量/评论数据（`yichen-wechat-mp-batch-exporter`）
@@ -40,7 +40,7 @@
 13. 把公共网页和平台搜索统一成可核验候选（`yichen-unified-search`）
 14. 只读取、下载和归档已知或已确认链接（`yichen-content-archive`）
 15. 在当轮授权闸门后直接执行私人收藏导出（`yichen-bookmarks-export`）
-16. 在 Step 与豆包/火山 ASR 之间安全路由并避免重复提交（`yichen-asr`）
+16. 在 Step、豆包/火山与免费本地 Whisper 之间按保存的引擎偏好路由转写，并避免重复提交（`yichen-asr`）
 17. 通过企业微信官方 CLI 创建授权文档并管理待办、会议和日程，不操控客户端（`yichen-wecom-operations`）
 18. 把一条公开 X Post 或 Thread 链接转成经过验收的 3:4 图片切片与成片，完整嵌入原生视频并在有源音轨时保留原声（`yichen-x-slicer`）
 19. 让 ChatGPT Pro 负责调研、架构和只读审查，Codex 独占本地代码修改和测试（`codex-chatgpt`）
@@ -90,13 +90,8 @@ Mac 微信双开——无需第三方工具，一条命令搞定：
 - `douyin_download.py` 通过 Playwright 拦截读取元数据或下载已知抖音视频
 - `xiaohongshu_fetch.py` 默认匿名读取已知笔记，再按要求下载视频、字幕或图片
 - 旧产物不会被覆盖，目标冲突时自动使用新的 `-run-N` 路径
-- 小红书 Cookie 必须取得当前任务明确授权，可选飞书沉淀也只在用户明确要求时执行
-
-### `yichen-volc-asr`
-本地音视频转写和口播粗剪：
-- 火山 ASR 和 TOS 配置全部通过环境变量读取
-- 输出转写稿、SRT 字幕、ASR 缓存和可选粗剪 MP4
-- 清理临时文件前必须得到用户明确允许
+- 只接受笔记/视频详情链接；下载中断时数据只留在 `.part` 文件并以非零退出码结束，metadata 只保存去掉 `xsec_token` 与签名参数的规范链接
+- 小红书 Cookie 必须取得当前任务明确授权，且只发往 `xiaohongshu.com` 主机；可选飞书沉淀也只在用户明确要求时执行
 
 ### `yichen-chatgpt-web-research`
 通过用户已登录的 ChatGPT 官网账号执行调研的旧版独立入口：
@@ -165,6 +160,7 @@ Mac 微信双开——无需第三方工具，一条命令搞定：
 - 将 AI 最新发现、普通/垂直网页搜索、平台原生发现、显式站点 Map 和原文核验分配给不同后端，不静默互相替代
 - 强制社交平台只读、目标级授权和禁止操控微信 UI
 - 自带可移植、只读的后端体检脚本；检查可选适配器就绪状态时不输出密钥值、不读取凭据文件内容，也不发起付费探针
+- 各后端的参数、限额和登录态规则只在子 Skill 中维护；总入口只保留阶段映射、跨阶段授权门、研究协议和体检
 
 完整家族、可选后端和配置说明见 [yichen-web-research/README.md](./yichen-web-research/README.md)。
 
@@ -178,6 +174,9 @@ Mac 微信双开——无需第三方工具，一条命令搞定：
 - X Quick 对每个查询独立执行；X Research 支持有界的多查询分阶段搜索、确定性去重、来源保留、时间窗检查和最多一轮缺口补搜
 - 内置适配器输出带来源、覆盖范围和限制说明的统一候选；GitHub、微信公众号、小红书、抖音、今日头和 B站的直接 CLI 计划仍是原始输出，除非另行明确提供下游标准化器
 - 浏览器会话复用仅限文档明确列出的有界公开只读路线；私域数据访问和所有写操作均不属于本 Skill
+- 原独立的 AI HOT Skill 已并入 AI HOT 路线：精选、日报与分类条目，`--max-pages` 翻页取全时间窗，并附中文简报格式
+- 自动路由逐条判断查询，进入原生平台前去掉“微博上”这类渠道提示词；原生平台带 `--domain`/`--hybrid` 时直接拒绝，不改走 AnySearch。公众号（搜狗）结果只给会过期的跳转链接，读取正文仍需 mp.weixin.qq.com 文章直链
+- 本版没有 Reddit 原生路线，只能用公共 `site:reddit.com` 网页索引；2026-10-31 核查时 Reddit 对机房出口封锁了其 JSON 接口
 
 完整说明见 [平台覆盖矩阵与路由边界](./yichen-unified-search/README.zh.md)。
 
@@ -204,6 +203,8 @@ Mac 微信双开——无需第三方工具，一条命令搞定：
 
 - 读取并归档已确认的网页、小红书、抖音、公众号、YouTube、B站和小宇宙目标
 - 内置唯一维护的抖音/小红书已知链接抓取器；小红书沉淀飞书仍需用户明确要求
+- 公众号已知文章链接改由本 Skill 自带的 `wechat_known_url.py` 读取：匿名直读公开页、支持图文页，并把正文图片存到本地；原中转站已停服，默认关闭。整号历史、互动数据或评论才使用 `yichen-wechat-mp-batch-exporter`
+- 小宇宙已知单集从官方音频 CDN 匿名下载，再经 `yichen-asr` 转写（默认 StepFun，可选本地 Whisper）；批量 StepFun 须 `--max-transcribe N`，`--download-only` 只下载不转写
 - 搜索与开放式发现不进入归档层
 - 使用不冲突输出目录、续跑检查点和显式覆盖保护
 
@@ -220,10 +221,12 @@ Mac 微信双开——无需第三方工具，一条命令搞定：
 
 ### `yichen-asr`
 
-统一 ASR 路由：
+唯一的转写入口（原 `yichen-volc-asr` 已并入）：
 
-- 纯文本默认走兼容 Step 执行器，时间戳/SRT 默认走 `yichen-volc-asr`
-- App ID 与 Token 只从环境变量读取
+- `transcribe.py` 用 StepFun 或免费本地 Whisper（`mlx-whisper` 或 `openai-whisper`）做纯文本转写；引擎按 `--asr-engine`、已保存的偏好、默认 StepFun 的顺序选择，首次运行会提示选择一次
+- 时间戳与 SRT 默认走 Step 国内站时间戳执行器；Step 被拒且未产生费用（额度或鉴权失败、一个分片都没转成）时，自动路由可在重新提交前改用豆包 2.0
+- 随附豆包/火山执行器，含 SRT 与 ffmpeg 粗剪链；Step 执行器由用户通过 `YICHEN_STEP_ASR_SCRIPT`、`YICHEN_STEP_ASR_TIMESTAMPS_SCRIPT` 自行配置
+- App ID、Token 与 TOS 配置只从环境变量读取；豆包执行器会把工作副本上传到你自己的 TOS 并设为公开读，敏感录音不要走这条路线
 - 已经提交到某服务商的任务不会静默改投另一家
 
 ### `yichen-wecom-operations`
@@ -280,10 +283,6 @@ yichen-skills/
 │  │  └─ wechat_dual_open.py
 │  └─ references/
 │     └─ reliability-and-risks.md
-├─ yichen-volc-asr/
-│  ├─ SKILL.md
-│  └─ scripts/
-│     └─ transcribe.py
 ├─ yichen-chatgpt-web-research/
 │  ├─ SKILL.md
 │  ├─ README.md
@@ -344,6 +343,11 @@ yichen-skills/
 │  ├─ agents/
 │  ├─ references/
 │  ├─ scripts/
+│  │  ├─ transcribe.py
+│  │  ├─ asr_engine.py
+│  │  ├─ route_asr.py
+│  │  ├─ asr_doctor.py
+│  │  └─ backends/volc_asr_transcribe.py
 │  └─ tests/
 ├─ yichen-wecom-operations/
 │  ├─ SKILL.md
@@ -386,7 +390,7 @@ yichen-skills/
   - 微信双开：`pip install Pillow`
   - 内容归档（抖音）：`pip install playwright requests && python3 -m playwright install chromium`
   - 内容归档（小红书）：`pip install requests`
-  - 火山 ASR 粗剪：`pip install requests`，并安装本机 `ffmpeg` / `ffprobe`
+  - ASR（`yichen-asr`）：豆包后端需要 `pip install requests`、本机 `ffmpeg` / `ffprobe` 和你自己的 TOS bucket；本地 Whisper 需要 `uv tool install mlx-whisper`（或 `openai-whisper`）与 `ffmpeg`；Step 执行器需另行安装
   - ChatGPT 官网调研：Chrome 已登录 ChatGPT，且当前 Agent 环境支持 Chrome/Computer Use 能力
   - 公众号批量导出：已知 URL 正文下载只需 Python 3 标准库；历史列表、阅读量和评论需要额外配置 `wechat-article-exporter` / `wxdown-service`
   - 企业微信本地解析：`pycryptodome`；只有明确授权抓取本机 raw key 时才需要 `frida`
@@ -409,7 +413,6 @@ yichen-skills/
 - `yichen-x-article-draft-uploader`
 - `yichen-wechat-local-vault`
 - `yichen-mac-wechat-dual-open`
-- `yichen-volc-asr`
 - `yichen-chatgpt-web-research`
 - `codex-chatgpt`
 - `yichen-agent-memory`
@@ -460,7 +463,7 @@ codex plugin add yichen-grok-consult@yichen-skills
 
 1. 安装 Playwright、requests 和 ffmpeg
 2. 用 `yichen-content-archive` 保存已知抖音或小红书对标素材
-3. 用 `yichen-volc-asr` 做转写、字幕或口播粗剪
+3. 用 `yichen-asr` 做转写、字幕或口播粗剪
 
 ### F）启用 `yichen-chatgpt-web-research`
 

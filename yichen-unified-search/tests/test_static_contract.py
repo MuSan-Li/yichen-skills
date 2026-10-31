@@ -1,10 +1,18 @@
 import pathlib
 import re
+import sys
 import unittest
+from unittest import mock
+
+from test_route_search import ROUTER, request
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 SKILL = ROOT / "SKILL.md"
+
+
+def read(relative):
+    return (ROOT / relative).read_text(encoding="utf-8")
 
 
 class StaticContractTests(unittest.TestCase):
@@ -219,6 +227,87 @@ class StaticContractTests(unittest.TestCase):
         self.assertIn("RejectRedirects", adapter)
         self.assertNotIn("api/comments/show", adapter)
         self.assertNotIn("CookieJar", adapter)
+
+
+class RouterDocumentationConsistencyTests(unittest.TestCase):
+    """Documented router bounds and keys must be the values the code actually uses."""
+
+    def test_documented_browser_search_windows_are_accepted_by_the_cli(self):
+        routes = read("references/routes.md")
+        self.assertIn("只接受 0/1/7/180", routes)
+        for platform in ("xiaohongshu", "douyin"):
+            capability = ROUTER.PLATFORM_CAPABILITIES[platform]
+            self.assertEqual(capability.days_values, frozenset({0, 1, 7, 180}))
+            self.assertEqual(capability.default_days, 1)
+            argv = ["route_search.py", "--query", "AI 编程", "--platform", platform, "--days", "180"]
+            with mock.patch.object(sys, "argv", argv):
+                parsed = ROUTER.parse_args()
+            self.assertEqual(ROUTER.plan(parsed)["status"], "ready")
+        self.assertEqual(ROUTER.MAX_DAYS, ROUTER.PLATFORM_CAPABILITIES["youtube"].days_range[1])
+        self.assertIn(f"全局接受 0–{ROUTER.MAX_DAYS}", routes)
+
+    def test_documented_research_wave_keys_exist_in_plans(self):
+        routes = read("references/routes.md")
+        self.assertNotIn("steps_after_gate", routes)
+        result = ROUTER.plan(request(platform="x", depth="research",
+                                     queries=tuple(f"focused query {i}" for i in range(12)),
+                                     target_results=20, max_searches=12))
+        waves = result["research"]["initial_waves"]
+        self.assertEqual(waves[0]["execute_from"], "top_level_steps")
+        self.assertIn("steps", result)
+        for wave in waves[1:]:
+            self.assertIn(wave["execute_from"], wave)
+        for value in {wave["execute_from"] for wave in waves}:
+            self.assertIn(f"`execute_from={value}`", routes)
+
+    def test_documented_x_quick_cap_and_domain_rule_match_the_router(self):
+        routes = read("references/routes.md")
+        self.assertIn(f"去重后最多 {ROUTER.X_QUICK_MAX_QUERIES} 个查询", routes)
+        self.assertIn(f"at most {ROUTER.X_QUICK_MAX_QUERIES} distinct queries", read("README.md"))
+        self.assertIn(f"`^{ROUTER.ANYSEARCH_DOMAIN_RE.pattern}$`", routes)
+        discovery = ROUTER.plan(request(platform="web", domain="legal"))["steps"][0]["argv"]
+        self.assertIn(" ".join(discovery[2:]), routes)
+        self.assertNotIn("<anysearch_cmd>", routes)
+
+
+class LiveRunDocumentationTests(unittest.TestCase):
+    """2026-10-31 live run: documented fields and formats must match what the scripts emit."""
+
+    def test_sub_domain_live_layout_is_documented(self):
+        routes = read("references/routes.md")
+        for phrase in ("Domain Capabilities (N available)", "### <domain>.<sub>", "**Parameters:**",
+                       "(required)", "optional_params", "params_known=false", "announced_count", "`partial`"):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, routes)
+
+    def test_redirect_wrapper_limitation_matches_the_adapter(self):
+        import anysearch_adapter
+        for relative in ("references/routes.md", "references/candidate-schema.md"):
+            text = read(relative)
+            with self.subTest(document=relative):
+                self.assertIn(anysearch_adapter.REDIRECT_WRAPPER_LIMITATION, text)
+                for host, paths in anysearch_adapter.SEARCH_REDIRECT_WRAPPERS.items():
+                    self.assertIn(f"`{host.replace('www.', '')}`", text)
+                    for path in paths:
+                        self.assertIn(f"`{path}`", text)
+        schema = read("references/candidate-schema.md")
+        for field in ("extract_markdown", "extract_title", "extract_url"):
+            self.assertIn(f"`{field}`", schema)
+
+    def test_router_split_and_rewrite_fields_are_documented(self):
+        routes = read("references/routes.md")
+        split = ROUTER.plan(request(queries=("知乎上 Agent", "RAG"), mode="batch"))
+        for key in split["query_routes"][0]:
+            with self.subTest(key=key):
+                self.assertIn(f"`{key}`", routes)
+        rewrite = ROUTER.plan(request(queries=("微博上 iPhone 18",)))["route"]["query_rewrites"][0]
+        for key in rewrite:
+            with self.subTest(key=key):
+                self.assertIn(f"`{key}`", routes)
+        self.assertIn("route.query_rewrites", routes)
+        self.assertNotIn("单平台批量的未标注查询可沿用", routes)
+        self.assertIn(ROUTER.GITHUB_REPO_JSON_FIELDS, routes)
+        self.assertIn("`[]` 是真实零结果", routes)
 
 
 if __name__ == "__main__":

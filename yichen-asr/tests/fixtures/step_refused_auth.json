@@ -1,0 +1,16 @@
+{
+  "status": "failed",
+  "chunks": 5,
+  "chunks_not_attempted": 4,
+  "chunks_transcribed": 0,
+  "stop_reason": "auth_failed",
+  "charge_free": true,
+  "failed_chunks": [
+    {
+      "index": 0,
+      "start_ms": 0,
+      "end_ms": 60000,
+      "error": "http_401: {\"error\":{\"type\":\"invalid_api_key\"}}"
+    }
+  ]
+}

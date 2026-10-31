@@ -4,12 +4,14 @@
 The command names remain parse-compatible for existing callers. Only `status`
 performs I/O, and it probes the fixed localhost root without following redirects.
 `login`, `search`, and `download` always fail before any client, file, or
-browser action. Known article URLs belong to $yichen-wechat-mp-batch-exporter.
+browser action. Known article URLs belong to scripts/wechat_known_url.py
+(route backend `wechat-known-url`).
 """
 
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import urllib.error
 import urllib.request
@@ -20,11 +22,12 @@ DEFAULT_API_BASE = "http://127.0.0.1:18901"
 ROOT_URL = DEFAULT_API_BASE + "/"
 RETIRED_COMMANDS = ("login", "search", "download")
 RETIRED_EXIT_CODE = 2
+KNOWN_URL_ROUTE = "wechat-known-url"
 RETIREMENT_ERROR = (
     "unsupported: this legacy command is retired and no client, file, or browser "
     "action was performed; route known mp.weixin.qq.com article URLs to "
-    "$yichen-wechat-mp-batch-exporter. Account search, complete-history sync, and "
-    "latest-N sync remain unavailable."
+    "scripts/wechat_known_url.py (wechat-known-url). Account search, "
+    "complete-history sync, and latest-N sync remain unavailable."
 )
 
 
@@ -55,7 +58,7 @@ def retired_command(command: str) -> int:
             "status": "unsupported",
             "error": RETIREMENT_ERROR,
             "side_effects_performed": False,
-            "known_url_route": "wechat-mp-batch-exporter",
+            "known_url_route": KNOWN_URL_ROUTE,
         }
     )
     return RETIRED_EXIT_CODE
@@ -78,8 +81,10 @@ def probe_localhost_root(timeout: int) -> tuple[bool, int | None, str | None]:
         # An HTTP response proves that the localhost root answered. Redirects are
         # deliberately not followed, and no response body is read.
         return True, exc.code, None
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        return False, None, str(exc)
+    except (urllib.error.URLError, OSError, http.client.HTTPException) as exc:
+        # OSError covers socket.timeout on Python 3.9; HTTPException covers a
+        # non-HTTP listener answering with a malformed status line.
+        return False, None, str(exc) or exc.__class__.__name__
 
 
 def command_status(timeout: int) -> int:
@@ -109,7 +114,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Retired local WeChat exporter compatibility CLI; use "
-            "$yichen-wechat-mp-batch-exporter for known article URLs"
+            "scripts/wechat_known_url.py for known article URLs"
         )
     )
     parser.add_argument("--timeout", type=int, default=45)

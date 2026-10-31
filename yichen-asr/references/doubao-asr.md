@@ -1,33 +1,6 @@
----
-name: yichen-volc-asr
-description: |
-  火山引擎音视频转写 + 口播自动粗剪 skill。用于语音转文字、视频转文字、音频识别、生成时间戳/SRT 字幕，也用于帮我剪口播、自动粗剪、删重复、删停顿、删口误、生成粗剪 MP4。
-  触发场景：用户说"帮我转写这个视频"、"音视频转文字"、"识别这个音频"、"帮我剪口播"、"自动剪辑"时使用。
-metadata:
-  triggers:
-    - /转写
-    - /剪口播
-    - 转写视频
-    - 转写音频
-    - 视频转文字
-    - 音频转文字
-    - 音视频转写
-    - 识别这个视频
-    - 识别这个音频
-    - 视频识别
-    - 音频识别
-    - 生成字幕
-    - 帮我剪口播
-    - 自动剪辑
-    - 自动粗剪
-    - 删停顿
-    - 删口误
-    - 删重复
----
+# 豆包 ASR 执行器与口播粗剪（原 `volc-asr`）
 
-# 火山 ASR 转写 + 口播自动粗剪
-
-这个 skill 同时负责两类任务：
+执行器：`~/.agents/skills/yichen-asr/scripts/backends/volc_asr_transcribe.py`（可用 `YICHEN_DOUBAO_ASR_SCRIPT` 覆盖；下文以 `VOLC` 代指它），命令行参数与并入前相同。负责两类任务：
 
 - 纯转写：把本地音视频识别成文字、时间戳和字幕。
 - 口播粗剪：基于 ASR 时间戳删重复、停顿、口误和废句，生成可进剪映精修的粗剪 MP4 和 SRT。
@@ -37,32 +10,35 @@ metadata:
 1. 原片不动。先复制一个工作副本，再对工作副本转写、复转写或剪辑。
 2. 不要直接删除任何文件。临时文件清理必须得到用户明确允许，并且只能先放到垃圾篓。
 3. 原片、工作副本、粗剪成片、复转写临时文件必须分开保存。
-4. 不要把 TOS、ASR Token、Cookie、API Key 写入 skill、普通记忆或日志；只从环境变量或用户指定的私有配置读取。
-5. ASR 扣费顺序固定为：先用火山控制台中仍有试用/时长包的豆包语音应用；试用/时长包确认用完后，才允许切到付费应用。试用和付费 AppID 都必须从环境变量读取，不在公开 skill 里硬编码。
-6. 试用和付费 token 必须分开：试用应用使用 `VOLC_ASR_TRIAL_TOKEN`，付费应用使用 `VOLC_ASR_PAID_TOKEN` 或旧的 `VOLC_ASR_TOKEN`。在试用包未用完前，不要用付费 token 冒充默认 token。
-7. 在试用/时长包未确认用完前，不得设置 `VOLC_ASR_TRIAL_EXHAUSTED=1`，也不得让 `VOLC_ASR_APP_ID` 指向付费应用；如确实要临时绕过，必须明确说明会扣费并获得用户确认。
-8. 长音频 ASR 提交成功后，不要重复跑同一文件来“再试一次”。优先等当前任务完成，或用已保存的 `{工作副本}.asr_pending.json` / `--request-id` 恢复查询，避免重复消耗试用时长或余额。
+4. 不要把 TOS、ASR Token、Cookie、API Key 写入 Skill、普通记忆或日志；只从环境变量或用户指定的私有配置读取。
+5. 执行器会把工作副本上传到用户自己的 TOS 并设为公开读，供识别服务拉取。敏感录音不要走这条路线；需要时改用 Step 时间戳执行器，或在识别完成后由用户自行处理 TOS 对象。
+6. ASR 扣费顺序固定为：先用火山控制台中仍有试用/时长包的豆包语音应用；试用/时长包确认用完后，才允许切到付费应用。试用和付费 AppID 都必须从环境变量读取，不在公开 Skill 里硬编码。
+7. 试用和付费 token 必须分开：试用应用使用 `VOLC_ASR_TRIAL_TOKEN`，付费应用使用 `VOLC_ASR_PAID_TOKEN` 或旧的 `VOLC_ASR_TOKEN`。在试用包未用完前，不要用付费 token 冒充默认 token。
+8. 在试用/时长包未确认用完前，不得设置 `VOLC_ASR_TRIAL_EXHAUSTED=1`，也不得让 `VOLC_ASR_APP_ID` 指向付费应用；如确实要临时绕过，必须明确说明会扣费并获得用户确认。
+9. 长音频 ASR 提交成功后，不要重复跑同一文件来“再试一次”。优先等当前任务完成，或用已保存的 `{工作副本}.asr_pending.json` / `--request-id` 恢复查询，避免重复消耗试用时长或余额。
 
 ## 使用方法
 
 ```bash
+VOLC=~/.agents/skills/yichen-asr/scripts/backends/volc_asr_transcribe.py
+
 # 基础用法：转写 + 分析 + 自动剪辑
-python3 yichen-volc-asr/scripts/transcribe.py '<工作副本路径>'
+python3 "$VOLC" '<工作副本路径>'
 
 # 只看标注不执行剪辑
-python3 yichen-volc-asr/scripts/transcribe.py '<工作副本路径>' --dry-run
+python3 "$VOLC" '<工作副本路径>' --dry-run
 
 # 忽略 ASR 缓存，重新识别
-python3 yichen-volc-asr/scripts/transcribe.py '<工作副本路径>' --no-cache
+python3 "$VOLC" '<工作副本路径>' --no-cache
 
 # 不执行 ffmpeg 剪辑，仍生成转写、标注和 SRT
-python3 yichen-volc-asr/scripts/transcribe.py '<工作副本路径>' --no-execute
+python3 "$VOLC" '<工作副本路径>' --no-execute
 
 # 只转写，不做剪辑分析或生成 SRT
-python3 yichen-volc-asr/scripts/transcribe.py '<工作副本路径>' --transcribe-only
+python3 "$VOLC" '<工作副本路径>' --transcribe-only
 
 # 只恢复查询已提交任务，不重新上传/提交
-python3 yichen-volc-asr/scripts/transcribe.py '<工作副本路径>' --request-id '<火山ASR request_id>' --no-execute
+python3 "$VOLC" '<工作副本路径>' --request-id '<火山ASR request_id>' --no-execute
 ```
 
 脚本默认使用 `VOLC_ASR_TRIAL_APP_ID`，并优先读取 `VOLC_ASR_TRIAL_TOKEN`。只有确认试用/时长包已经用完后，才设置 `VOLC_ASR_TRIAL_EXHAUSTED=1`，脚本才会切到 `VOLC_ASR_PAID_APP_ID` 并读取 `VOLC_ASR_PAID_TOKEN` 或旧的 `VOLC_ASR_TOKEN`。如确实需要切到其他火山语音应用，先设置 `VOLC_ASR_APP_ID`；若该应用不是试用包应用且未标记试用已用完，脚本会停止，除非同时显式设置 `VOLC_ASR_ALLOW_NON_TRIAL_APP=1`。
@@ -85,16 +61,16 @@ python3 yichen-volc-asr/scripts/transcribe.py '<工作副本路径>' --request-i
 
 1. 确认输入文件存在、大小正常；必要时用 `ffprobe` 看时长和编码。
 2. 复制原片为工作副本，例如 `source_for_asr.mp4`。
-3. 运行 `python3 yichen-volc-asr/scripts/transcribe.py '<工作副本路径>' --no-execute`。
+3. 运行 `python3 "$VOLC" '<工作副本路径>' --no-execute`。
 4. 交付转写稿、时间戳、字幕草稿和缓存路径。
 5. 明确说明本次没有做剪辑。
 
 ## 口播自动粗剪流程
 
-当用户要“帮我剪口播”“自动粗剪”“删重复/停顿/口误/断句”时：
+当用户要“帮我剪口播”“自动粗剪”“删重复/停顿/口误/断句”，并明确要豆包或只要 ffmpeg 一次性粗剪时：
 
 1. 复制原片为工作副本，避免原片被改动。
-2. 用火山 ASR 生成带时间戳的转写稿和 `.asr_cache.json`。
+2. 用豆包 ASR 生成带时间戳的转写稿和 `.asr_cache.json`。
 3. 写一份可读删留方案：
    - `KEEP`：干净、有信息量、叙事必要的内容。
    - `DELETE`：口误、重复、长停顿、废句、半句话、无效语气词。
@@ -104,6 +80,8 @@ python3 yichen-volc-asr/scripts/transcribe.py '<工作副本路径>' --request-i
 6. 对粗剪 MP4 做复转写审核。
 7. 通过审核后，输出粗剪 MP4、SRT、转写稿、删留方案和复查说明。
 8. 如需继续精修，将粗剪 MP4 和 SRT 作为交付素材，供后续导入剪映/CapCut。
+
+默认的剪辑流程优先使用 Step 时间戳执行器的结果；只有用户明确要豆包，或只要 ffmpeg 一次性粗剪时才走本流程。
 
 ## 剪辑规则
 

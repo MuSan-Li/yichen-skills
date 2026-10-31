@@ -10,10 +10,12 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import http.client
 import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import urllib.error
@@ -51,6 +53,16 @@ BACKEND_API = "youtube-data-api-v3"
 BACKEND_YTDLP = "yt-dlp-flat-search"
 CHANNEL_ID_RE = re.compile(r"^UC[A-Za-z0-9_-]{22}$")
 VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
+# yt-dlp flat listings only carry a timestamp when this YoutubeTab extractor
+# argument is set; YoutubeSearchIE shares the same tab renderer code path, so it
+# covers ytsearch and channel /videos listings. The value is parsed from relative
+# text such as "3 days ago" and is therefore approximate.
+YTDLP_APPROXIMATE_DATE_ARG = "youtubetab:approximate_date"
+APPROXIMATE_TIME_PRECISION = "approximate_relative_time"
+APPROXIMATE_TIME_LIMITATION = (
+    "published_at was approximated by yt-dlp from YouTube relative time text "
+    "(for example '3 days ago'); it can be off by about one unit of that text."
+)
 
 
 class SearchError(RuntimeError):
@@ -180,7 +192,12 @@ def api_get(endpoint: str, params: dict[str, Any], *, key: str, timeout: int) ->
         else:
             category = "upstream_http_error"
         raise SearchError(category, f"YouTube Data API returned HTTP {exc.code}.") from None
-    except (urllib.error.URLError, TimeoutError):
+    except (urllib.error.URLError, http.client.HTTPException, OSError) as exc:
+        # Python 3.9 raises socket.timeout (not TimeoutError) while waiting for
+        # headers or body, and urllib does not wrap it in URLError there.
+        reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+        if isinstance(reason, (socket.timeout, TimeoutError)):
+            raise SearchError("timeout", "YouTube Data API request timed out.") from None
         raise SearchError("network_error", "YouTube Data API could not be reached.") from None
 
     if len(body) > MAX_API_RESPONSE_BYTES:
@@ -303,6 +320,7 @@ def api_search(
                 "duration_seconds": parse_duration(content_details.get("duration")),
                 "views": int_or_none(statistics.get("viewCount")),
                 "likes": int_or_none(statistics.get("likeCount")),
+                "published_at_precision": "exact",
             }
         )
     return results
@@ -360,6 +378,8 @@ def run_ytdlp(
         "--no-cache-dir",
         "--skip-download",
         "--flat-playlist",
+        "--extractor-args",
+        YTDLP_APPROXIMATE_DATE_ARG,
         "--dump-single-json",
         "--no-warnings",
         "--playlist-end",
@@ -397,6 +417,7 @@ def run_ytdlp(
         video_id = text_or_none(entry.get("id"))
         if not video_id or not VIDEO_ID_RE.fullmatch(video_id):
             continue
+        published_at = published_at_from_flat(entry)
         normalized.append(
             {
                 "id": video_id,
@@ -405,10 +426,13 @@ def run_ytdlp(
                 "description": text_or_none(entry.get("description")),
                 "channel": text_or_none(entry.get("channel") or entry.get("uploader")),
                 "channel_id": text_or_none(entry.get("channel_id") or entry.get("uploader_id")),
-                "published_at": published_at_from_flat(entry),
+                "published_at": published_at,
                 "duration_seconds": int_or_none(entry.get("duration")),
                 "views": int_or_none(entry.get("view_count")),
                 "likes": int_or_none(entry.get("like_count")),
+                "published_at_precision": (
+                    APPROXIMATE_TIME_PRECISION if published_at else None
+                ),
             }
         )
     return normalized
@@ -423,7 +447,12 @@ def filter_and_sort(
     after: datetime | None,
     before: datetime | None,
     sort_by: str | None,
+    stats: dict[str, int] | None = None,
 ) -> list[dict[str, Any]]:
+    """Filter rows locally; ``stats`` receives time-window drop counts."""
+    if stats is not None:
+        stats.setdefault("time_unknown_dropped", 0)
+        stats.setdefault("outside_time_window", 0)
     filtered: list[dict[str, Any]] = []
     query_lower = query.casefold() if query else None
     for row in rows:
@@ -445,9 +474,15 @@ def filter_and_sort(
                 parsed_published = datetime.fromisoformat(published.replace("Z", "+00:00"))
             except ValueError:
                 pass
-        if after and (parsed_published is None or parsed_published < after):
+        if (after or before) and parsed_published is None:
+            if stats is not None:
+                stats["time_unknown_dropped"] += 1
             continue
-        if before and (parsed_published is None or parsed_published > before):
+        if (after and parsed_published < after) or (
+            before and parsed_published > before
+        ):
+            if stats is not None:
+                stats["outside_time_window"] += 1
             continue
         filtered.append(row)
 
@@ -469,6 +504,21 @@ def candidate(
     snippet = row.get("description")
     if snippet and len(snippet) > 500:
         snippet = f"{snippet[:497]}..."
+    limitations = [
+        "This is a public discovery candidate; the original watch page was not opened.",
+        "YouTube search and channel listings are not guaranteed to be exhaustive.",
+    ]
+    provenance = {
+        "source_id": video_id,
+        "retrieved_at": retrieved_at,
+        "route_reason": "public_youtube_discovery",
+    }
+    if (
+        row.get("published_at")
+        and row.get("published_at_precision") == APPROXIMATE_TIME_PRECISION
+    ):
+        provenance["published_at_precision"] = APPROXIMATE_TIME_PRECISION
+        limitations.append(APPROXIMATE_TIME_LIMITATION)
     return {
         "candidate_id": f"youtube:{video_id}",
         "query": query,
@@ -496,21 +546,14 @@ def candidate(
             "opened_original": False,
             "checked_at": None,
         },
-        "provenance": {
-            "source_id": video_id,
-            "retrieved_at": retrieved_at,
-            "route_reason": "public_youtube_discovery",
-        },
+        "provenance": provenance,
         "platform_fields": {
             "youtube": {
                 "channel_id": row.get("channel_id"),
                 "duration_seconds": row.get("duration_seconds"),
             }
         },
-        "limitations": [
-            "This is a public discovery candidate; the original watch page was not opened.",
-            "YouTube search and channel listings are not guaranteed to be exhaustive.",
-        ],
+        "limitations": limitations,
     }
 
 
@@ -523,12 +566,23 @@ def envelope(
     rows: list[dict[str, Any]],
     time_range: dict[str, Any] | None,
     extra_limitations: list[str] | None = None,
+    time_filter_stats: dict[str, int] | None = None,
 ) -> dict[str, Any]:
     limitations = [
         "Public YouTube discovery is not exhaustive and can vary by backend or region.",
         "Search results are candidates only; open the original URL before citing facts.",
     ]
     limitations.extend(extra_limitations or [])
+    status = "completed"
+    time_unknown_dropped = (time_filter_stats or {}).get("time_unknown_dropped", 0)
+    if time_unknown_dropped:
+        # Unknown publication time cannot be proven inside the window; the
+        # dropped rows make this a partial result rather than a verified zero.
+        status = "partial"
+        limitations.append(
+            f"{time_unknown_dropped} result(s) without a usable publication time were "
+            "dropped by the local time window; the time-filtered result set is incomplete."
+        )
     retrieved_at = iso_z(utc_now())
     candidates = [
         candidate(row, query=query, rank=index, backend=backend, retrieved_at=retrieved_at)
@@ -548,7 +602,7 @@ def envelope(
                 "backend": backend,
                 "mode": mode,
                 "login_state_used": False,
-                "status": "completed",
+                "status": status,
                 "limitations": limitations,
             }
         ],
@@ -559,6 +613,20 @@ def envelope(
                 "query_count": 1,
                 "returned_count": len(candidates),
                 "truncated": len(rows) > limit,
+                "published_at_precision": (
+                    APPROXIMATE_TIME_PRECISION if backend == BACKEND_YTDLP else "exact"
+                ),
+                "time_filter": (
+                    {
+                        "applied": "local",
+                        "time_unknown_dropped": time_unknown_dropped,
+                        "outside_time_window": time_filter_stats.get(
+                            "outside_time_window", 0
+                        ),
+                    }
+                    if time_filter_stats is not None
+                    else None
+                ),
                 "login_state_used": False,
                 "limitations": limitations,
             }
@@ -718,7 +786,15 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
             fallback_limitations.append(
                 f"Anonymous yt-dlp does not guarantee API-level {args.order} ordering."
             )
+        if args.after_dt or args.before_dt:
+            fallback_limitations.append(
+                "The time window was applied locally to approximate yt-dlp publication "
+                "times; videos near the window edge may be misclassified."
+            )
 
+    time_filter_stats: dict[str, int] | None = (
+        {} if args.after_dt or args.before_dt else None
+    )
     rows = filter_and_sort(
         rows,
         query=local_query,
@@ -727,6 +803,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
         after=args.after_dt,
         before=args.before_dt,
         sort_by=args.sort_by,
+        stats=time_filter_stats,
     )
     time_range = (
         {
@@ -745,6 +822,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
         rows=rows,
         time_range=time_range,
         extra_limitations=fallback_limitations,
+        time_filter_stats=time_filter_stats,
     )
 
 

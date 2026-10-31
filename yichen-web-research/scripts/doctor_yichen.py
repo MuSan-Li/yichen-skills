@@ -21,12 +21,7 @@ SKILLS_ROOT = Path(
 OPENCLI_HOME = Path(
     os.environ.get("OPENCLI_HOME", str(Path.home() / ".opencli"))
 ).expanduser()
-STEP_ASR = Path(
-    os.environ.get(
-        "YICHEN_STEP_ASR_SCRIPT",
-        str(SKILLS_ROOT / "step-asr/scripts/step_asr_transcribe.py"),
-    )
-).expanduser()
+# Step/Doubao executor paths belong to yichen-asr; read their state from its doctor only.
 UNIFIED_ASR_DOCTOR = (
     SKILLS_ROOT / "yichen-asr/scripts/asr_doctor.py"
 )
@@ -45,7 +40,7 @@ XIAOYUZHOU_OPENCLI_CREDENTIALS = Path(
         str(OPENCLI_HOME / "xiaoyuzhou.json"),
     )
 ).expanduser()
-WECHAT_MP_LOCAL = ARCHIVE_SCRIPTS / "wechat_mp_local.py"
+WECHAT_KNOWN_URL = ARCHIVE_SCRIPTS / "wechat_known_url.py"
 TOUTIAO_SEARCH_ADAPTER = OPENCLI_HOME / "clis/toutiao/search.js"
 TOUTIAO_HEADLESS_ADAPTER = OPENCLI_HOME / "clis/toutiao/headless.js"
 TOUTIAO_ANONYMOUS_PROFILE = OPENCLI_HOME / "toutiao-anonymous-profile"
@@ -78,6 +73,7 @@ FIRECRAWL_KEY_FILE = Path(
     )
 ).expanduser()
 ZHIHU_ADAPTER = SKILLS_ROOT / "yichen-unified-search/scripts/zhihu_adapter.py"
+AIHOT_SEARCH = SKILLS_ROOT / "yichen-unified-search/scripts/aihot_search.py"
 ZHIHU_CLI_VALUE = (
     os.environ.get("ZHIHU_CLI")
     or shutil.which("zhihu-cli")
@@ -125,6 +121,19 @@ def safe_metadata_environment(
         for name, value in source.items()
         if name.upper() in SAFE_METADATA_ENV_NAMES
     }
+
+
+def aihot_channel_status() -> dict[str, object]:
+    """AI HOT is a unified-search route; check only that its adapter is installed."""
+    present = AIHOT_SEARCH.is_file()
+    return {"status": "ok" if present else "error", "name": "AI HOT 近期 AI 精选与日报",
+            "adapter_present": present,
+            "backends": ["AI HOT public API via yichen-unified-search aihot_search.py"],
+            "active_backend": "aihot_search.py" if present else None,
+            "message": ("统一搜索 AI HOT 适配器就绪；体检不发请求，服务可用性未验证"
+                        if present else "统一搜索 AI HOT 适配器缺失"),
+            "credential_required": False,
+            "network_probe_performed": False, "content_access_verified": False}
 
 
 def firecrawl_key_source() -> str | None:
@@ -314,14 +323,13 @@ def zhihu_channel_status() -> dict[str, object]:
     }
 
 
-def stepfun_key_available() -> bool:
-    """Report only explicitly exported Step credentials.
-
-    The public doctor deliberately does not import or execute the configured
-    Step ASR script: ``YICHEN_STEP_ASR_SCRIPT`` may point to user-controlled
-    code, while a read-only readiness check must not execute arbitrary modules.
-    """
-    return bool(os.environ.get("STEPFUN_API_KEY") or os.environ.get("STEP_API_KEY"))
+def step_asr_prerequisites(asr: dict[str, object] | None) -> dict[str, bool]:
+    """Read Step text-ASR script/key presence from yichen-asr's doctor; unknown means not ready."""
+    step = asr.get("step") if isinstance(asr, dict) else None
+    if not isinstance(step, dict):
+        return {"step_asr": False, "stepfun_key": False}
+    return {"step_asr": step.get("script_present") is True,
+            "stepfun_key": step.get("credential_present") is True}
 
 
 def unified_asr_status() -> dict[str, object] | None:
@@ -388,33 +396,6 @@ def fieldtheory_graphql_only_status() -> tuple[bool, str]:
     if ready:
         return True, f"Field Theory {version} GraphQL-only 路线就绪；doctor 不读取私人书签"
     return False, "Field Theory 不是预期的 GraphQL-only 本地覆盖层"
-
-
-def wechat_mp_local_status() -> tuple[bool, str, bool]:
-    if not WECHAT_MP_LOCAL.exists():
-        return False, "公众号本地客户端缺失", False
-    try:
-        result = subprocess.run(
-            [sys.executable, str(WECHAT_MP_LOCAL), "status"],
-            check=False,
-            text=True,
-            capture_output=True,
-            timeout=15,
-        )
-        payload = json.loads(result.stdout)
-    except (OSError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
-        return False, f"公众号本地服务检查失败：{exc}", False
-    service_ready = bool(payload.get("service_reachable")) and bool(payload.get("localhost_only"))
-    login_ready = payload.get("login_status") == "ready"
-    if service_ready and login_ready:
-        return True, "本机私有服务可用；公众号搜索登录态就绪", True
-    if service_ready:
-        return (
-            True,
-            "本机私有服务可用；已知链接可抓取，公众号搜索登录态未读取",
-            False,
-        )
-    return False, "本机私有服务不可用", False
 
 
 def opencli_search_metadata(site: str) -> dict | None:
@@ -663,6 +644,7 @@ def local_public_channels() -> dict[str, dict[str, object]]:
 def main() -> None:
     channels = local_public_channels()
     channels["zhihu"] = zhihu_channel_status()
+    channels["aihot"] = aihot_channel_status()
 
     asr = unified_asr_status()
     asr_ready = bool(asr and asr.get("ok"))
@@ -865,11 +847,12 @@ def main() -> None:
         "active_backend": "Field Theory GraphQL-only" if fieldtheory_ready else None,
     }
 
+    step_prerequisites = step_asr_prerequisites(asr)
     prerequisites = {
         "wrapper": XIAOYUZHOU.exists(),
-        "step_asr": STEP_ASR.exists(),
+        "step_asr": step_prerequisites["step_asr"],
         "ffmpeg": shutil.which("ffmpeg") is not None,
-        "stepfun_key": stepfun_key_available(),
+        "stepfun_key": step_prerequisites["stepfun_key"],
     }
     ready = all(prerequisites.values())
     opencli_ready = xiaoyuzhou_opencli_available()
@@ -899,9 +882,11 @@ def main() -> None:
         "opencli_credentials_present": opencli_credentials_present,
     }
 
-    wechat_ready, wechat_message, wechat_login_ready = wechat_mp_local_status()
+    # Known article URLs are read anonymously by yichen-content-archive; no local service or login.
+    wechat_ready = WECHAT_KNOWN_URL.is_file()
+    wechat_message = "已知文章链接匿名读取执行器就绪" if wechat_ready else "已知文章链接执行器缺失"
     sogou_search_ready = opencli_search_available("weixin", ("query", "--page", "--limit"))
-    wechat_backends = ["localhost wechat-article-exporter"]
+    wechat_backends = ["anonymous known article URL (yichen-content-archive)"]
     if sogou_search_ready:
         wechat_backends.insert(0, "Sogou Weixin public search via OpenCLI")
     channels["wechat_mp"] = {
@@ -915,16 +900,18 @@ def main() -> None:
         "tier": 1,
         "backends": wechat_backends,
         "active_backend": (
-            "Sogou Weixin public search + 127.0.0.1:18901"
+            "Sogou Weixin public search + anonymous known article URL"
             if wechat_ready and sogou_search_ready
-            else "127.0.0.1:18901"
+            else "anonymous known article URL"
             if wechat_ready
             else "Sogou Weixin public search"
             if sogou_search_ready
             else None
         ),
         "global_search_ready": sogou_search_ready,
-        "login_ready": wechat_login_ready,
+        "known_url_adapter_ready": wechat_ready,
+        "login_required": False,
+        "account_history_route": "yichen-wechat-mp-batch-exporter",
     }
     print(json.dumps(channels, ensure_ascii=False, indent=2))
 

@@ -62,25 +62,18 @@ BROWSER_LIMITATIONS = [
 FALLBACK_ERROR_CATEGORIES = frozenset(
     {"access_gate_redirect", "access_gate_rejected", "access_gate_response"}
 )
-ACCESS_GATE_MARKERS = (
-    "login",
-    "log in",
-    "sign in",
-    "signin",
-    "passport",
-    "verify",
-    "verification",
-    "captcha",
-    "forbidden",
-    "access denied",
-    "登录",
-    "验证",
-    "验证码",
-    "访问受限",
-    "请先登录",
-    "安全验证",
-    "账号异常",
-)
+# Access gates are recognized only by structure: the m.weibo.cn login-required
+# code, or a returned URL whose host is a Weibo/Sina passport or login host.
+# Page text is never scanned, so ordinary content or "参数验证失败" style
+# messages cannot unlock the browser-session fallback.
+ACCESS_GATE_OK_CODES = (-100, "-100")
+ACCESS_GATE_HOST_LABELS = frozenset({"passport", "login"})
+ACCOUNT_DOMAINS = ("weibo.cn", "weibo.com", "sina.com.cn", "sina.cn")
+END_OF_RESULTS_MESSAGE = "这里还没有内容"
+# Characters that would split or re-decode the inner "type=1&q=" query string.
+CONTAINERID_RESERVED_RE = re.compile(r"[%&=+#]")
+# Same shape the router accepts; a leading '-' would be parsed as an OpenCLI option.
+OPENCLI_PROFILE_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_-]{0,63}")
 OPENCLI_SAFE_ENV_NAMES = frozenset(
     {
         "PATH",
@@ -108,6 +101,8 @@ OPENCLI_SAFE_ENV_NAMES = frozenset(
         "DBUS_SESSION_BUS_ADDRESS",
         "XAUTHORITY",
         "OPENCLI_HOME",
+        # Selects the connected Browser Bridge profile; it carries no credential.
+        "OPENCLI_PROFILE",
     }
 )
 
@@ -128,16 +123,60 @@ class RejectRedirects(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def looks_like_access_gate(value: Any) -> bool:
-    if isinstance(value, str):
-        text = value
-    else:
-        try:
-            text = json.dumps(value, ensure_ascii=False)
-        except (TypeError, ValueError):
-            return False
-    lowered = text.casefold()
-    return any(marker in lowered for marker in ACCESS_GATE_MARKERS)
+def is_login_host_url(value: Any) -> bool:
+    """True only for an absolute URL on a Weibo/Sina passport or login host."""
+
+    if not isinstance(value, str) or not value.strip():
+        return False
+    try:
+        parsed = urllib.parse.urlsplit(value.strip())
+        hostname = (parsed.hostname or "").lower()
+    except ValueError:
+        return False
+    if parsed.scheme not in {"http", "https"}:
+        return False
+    domain = next(
+        (
+            candidate
+            for candidate in ACCOUNT_DOMAINS
+            if hostname == candidate or hostname.endswith("." + candidate)
+        ),
+        None,
+    )
+    if domain is None:
+        return False
+    labels = hostname[: -len(domain)].rstrip(".").split(".")
+    return any(label in ACCESS_GATE_HOST_LABELS for label in labels if label)
+
+
+def is_access_gate_payload(payload: Any) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    ok = payload.get("ok")
+    if not isinstance(ok, bool) and ok in ACCESS_GATE_OK_CODES:
+        return True
+    return is_login_host_url(payload.get("url"))
+
+
+def is_end_of_results(payload: dict[str, Any]) -> bool:
+    """``ok: 0`` with no cards is how the mobile index ends pagination."""
+
+    ok = payload.get("ok")
+    if isinstance(ok, bool) or ok not in (0, "0"):
+        return False
+    data = payload.get("data")
+    if isinstance(data, dict) and "cards" in data:
+        return data.get("cards") == []
+    return data in (None, [], {}) and strip_html(payload.get("msg")) == END_OF_RESULTS_MESSAGE
+
+
+def containerid_for(keyword: str) -> str:
+    # The containerid value is itself a query string; encode its delimiters so
+    # "AT&T 5G" stays one keyword. Other characters are left as before.
+    encoded = CONTAINERID_RESERVED_RE.sub(
+        lambda match: "%{:02X}".format(ord(match.group(0))), keyword
+    )
+    return f"100103type=1&q={encoded}"
 
 
 def opencli_child_environment(
@@ -239,7 +278,11 @@ def parse_weibo_datetime(value: Any, now: datetime) -> datetime | None:
         except ValueError:
             return None
         if candidate > now + timedelta(days=2):
-            candidate = candidate.replace(year=now.year - 1)
+            try:
+                candidate = candidate.replace(year=now.year - 1)
+            except ValueError:
+                # "02-29" seen early in a leap year cannot belong to last year.
+                return None
         return candidate
     match = re.fullmatch(
         r"(?:(\d{4})年)?(\d{1,2})月(\d{1,2})日\s*(\d{1,2}):(\d{2})",
@@ -258,7 +301,10 @@ def parse_weibo_datetime(value: Any, now: datetime) -> datetime | None:
         except ValueError:
             return None
         if match.group(1) is None and candidate > now + timedelta(days=2):
-            candidate = candidate.replace(year=now.year - 1)
+            try:
+                candidate = candidate.replace(year=now.year - 1)
+            except ValueError:
+                return None
         return candidate
     return None
 
@@ -274,6 +320,20 @@ def nonnegative_int(value: Any) -> int | None:
     if isinstance(value, str) and re.fullmatch(r"\d+", value.strip()):
         return int(value.strip())
     return None
+
+
+COUNT_UNITS = {"万": 10_000, "亿": 100_000_000}
+
+
+def display_count(value: Any) -> tuple[int | None, bool]:
+    """Exact integers, or Weibo's rounded "1.2万"/"3亿" display counts as (value, approximate)."""
+    exact = nonnegative_int(value)
+    if exact is not None or not isinstance(value, str):
+        return exact, False
+    match = re.fullmatch(r"(\d+(?:\.\d+)?)\s*([万亿])", value.strip())
+    if not match:
+        return None, False
+    return int(round(float(match.group(1)) * COUNT_UNITS[match.group(2)])), True
 
 
 def valid_cookie_component(value: Any) -> str | None:
@@ -385,7 +445,11 @@ class WeiboPublicClient:
         body = self._read(request)
         match = re.search(r"visitor_callback\((\{.*\})\)\s*;?\s*$", body, flags=re.S)
         if not match:
-            if looks_like_access_gate(body):
+            try:
+                bare = json.loads(body)
+            except json.JSONDecodeError:
+                bare = None
+            if is_access_gate_payload(bare):
                 raise AdapterError(
                     "access_gate_response",
                     "Weibo visitor passport returned a login or verification gate.",
@@ -401,13 +465,13 @@ class WeiboPublicClient:
                 "visitor_session_error", "Weibo visitor passport returned invalid JSON."
             ) from None
         if not isinstance(payload_json, dict):
-            if looks_like_access_gate(payload_json):
-                raise AdapterError(
-                    "access_gate_response",
-                    "Weibo visitor passport returned a login or verification gate.",
-                )
             raise AdapterError(
                 "visitor_session_error", "Weibo visitor passport returned an invalid shape."
+            )
+        if is_access_gate_payload(payload_json):
+            raise AdapterError(
+                "access_gate_response",
+                "Weibo visitor passport returned a login or verification gate.",
             )
         data = payload_json.get("data")
         data = data if isinstance(data, dict) else {}
@@ -438,32 +502,25 @@ class WeiboPublicClient:
         try:
             parsed = json.loads(body)
         except json.JSONDecodeError:
-            if looks_like_access_gate(body):
-                raise AdapterError(
-                    "access_gate_response",
-                    "Weibo public search returned a login or verification gate.",
-                )
+            # Non-JSON pages are protocol drift, not a gate: their text is not scanned.
             raise AdapterError(
                 "invalid_response", "Weibo public search returned non-JSON content."
             ) from None
         if not isinstance(parsed, dict):
-            if looks_like_access_gate(parsed):
-                raise AdapterError(
-                    "access_gate_response",
-                    "Weibo public search returned a login or verification gate.",
-                )
             raise AdapterError(
                 "invalid_response", "Weibo public search returned an unexpected JSON shape."
             )
+        if is_access_gate_payload(parsed):
+            raise AdapterError(
+                "access_gate_rejected",
+                "Weibo public search returned an explicit login or verification gate.",
+            )
         ok = parsed.get("ok")
         if ok is not None and ok not in (1, True, "1"):
+            if is_end_of_results(parsed):
+                return {"ok": 0, "data": {"cards": []}}
             message = clipped_text(strip_html(parsed.get("msg")), 120)
             suffix = f": {message}" if message else "."
-            if looks_like_access_gate(message):
-                raise AdapterError(
-                    "access_gate_rejected",
-                    "Weibo public search returned an explicit login or verification gate.",
-                )
             raise AdapterError(
                 "upstream_rejected", f"Weibo public search rejected the request{suffix}"
             )
@@ -475,28 +532,18 @@ class WeiboPublicClient:
         payload = self.get_json(
             SEARCH_URL,
             {
-                "containerid": f"100103type=1&q={keyword}",
+                "containerid": containerid_for(keyword),
                 "page_type": "searchall",
                 "page": page,
             },
         )
         data = payload.get("data")
         if not isinstance(data, dict):
-            if looks_like_access_gate(payload):
-                raise AdapterError(
-                    "access_gate_response",
-                    "Weibo public search returned an explicit login or verification gate.",
-                )
             raise AdapterError(
                 "invalid_response", "Weibo public search response is missing a data object."
             )
         cards = data.get("cards")
         if not isinstance(cards, list):
-            if looks_like_access_gate(payload):
-                raise AdapterError(
-                    "access_gate_response",
-                    "Weibo public search returned an explicit login or verification gate.",
-                )
             raise AdapterError(
                 "invalid_response", "Weibo public search response is missing a cards list."
             )
@@ -590,7 +637,8 @@ def normalize_post(
                 "source": strip_html(raw.get("source")) or None,
                 "created_at_raw": created_raw or None,
                 "verified": user.get("verified") if isinstance(user.get("verified"), bool) else None,
-                "followers_count": nonnegative_int(user.get("followers_count")),
+                "followers_count": display_count(user.get("followers_count"))[0],
+                "followers_count_approximate": display_count(user.get("followers_count"))[1],
                 "picture_count": picture_count,
                 "has_video": page_info.get("type") == "video",
             }
@@ -933,11 +981,42 @@ def run_browser_search(
     now: datetime,
     runner: Callable[..., Any] = subprocess.run,
     opencli_path: str | None = None,
+    opencli_profile: str | None = None,
 ) -> dict[str, Any]:
     """Run one allowlisted OpenCLI public search without handling Cookie values."""
 
     retrieved_at = iso_time(now)
     assert retrieved_at is not None
+    refusal = None
+    if query.lstrip().startswith("-"):
+        refusal = "A query starting with '-' would be parsed as an OpenCLI option; the browser search was not run."
+    elif opencli_profile is not None and not OPENCLI_PROFILE_RE.fullmatch(opencli_profile):
+        refusal = "The OpenCLI profile name is invalid; the browser search was not run."
+    if refusal:
+        return envelope(
+            query=query,
+            limit=limit,
+            max_pages=1,
+            days=days,
+            now=now,
+            candidates=[],
+            status="failed",
+            pages_attempted=0,
+            pages_completed=0,
+            raw_result_count=0,
+            rejected_count=0,
+            duplicate_count=0,
+            filtered_outside_window=0,
+            unknown_time_count=0,
+            truncated=False,
+            request_count=0,
+            errors=[
+                {"backend": BROWSER_BACKEND, "category": "invalid_request", "message": refusal}
+            ],
+            backend=BROWSER_BACKEND,
+            login_state_used=False,
+            route_reason="public_weibo_readonly_browser_fallback",
+        )
     resolved_opencli = opencli_path or shutil.which("opencli")
     if not resolved_opencli:
         return envelope(
@@ -970,6 +1049,8 @@ def run_browser_search(
         )
     command = [
         resolved_opencli,
+        # Global option: selects one connected Browser Bridge profile for this run only.
+        *(["--profile", opencli_profile] if opencli_profile else []),
         "weibo",
         "search",
         query,
@@ -1057,6 +1138,16 @@ def run_browser_search(
         candidates.append(candidate)
     for rank, candidate in enumerate(candidates, start=1):
         candidate["rank"] = rank
+    considered = min(len(rows), limit)
+    if not errors and considered and rejected_count == considered:
+        # Rows came back but none had a trusted post identity: drift, not zero results.
+        errors.append(
+            {
+                "backend": BROWSER_BACKEND,
+                "category": "browser_rows_rejected",
+                "message": f"OpenCLI Weibo search returned {considered} row(s), but none had a trusted public post URL and text.",
+            }
+        )
     status = (
         "failed"
         if errors
@@ -1107,7 +1198,9 @@ def merge_browser_fallback(
 ) -> dict[str, Any]:
     """Merge recovered public candidates without preserving credential-bearing logs."""
 
-    browser_succeeded = not browser.get("errors")
+    # Only usable candidates count as recovery; an empty or fully rejected
+    # fallback keeps the anonymous access-gate errors visible.
+    browser_succeeded = not browser.get("errors") and bool(browser.get("candidates"))
     merged = dict(anonymous)
     candidates: list[dict[str, Any]] = []
     seen_ids: set[str] = set()
@@ -1157,6 +1250,7 @@ def run_search_auto(
     client: WeiboPublicClient | None = None,
     runner: Callable[..., Any] = subprocess.run,
     opencli_path: str | None = None,
+    opencli_profile: str | None = None,
 ) -> dict[str, Any]:
     if session_mode not in {"auto", "anonymous"}:
         raise AdapterError(
@@ -1181,6 +1275,7 @@ def run_search_auto(
         now=now,
         runner=runner,
         opencli_path=opencli_path,
+        opencli_profile=opencli_profile,
     )
     return merge_browser_fallback(anonymous, browser, limit=limit)
 
@@ -1200,6 +1295,10 @@ def self_test() -> dict[str, Any]:
     )
     assert nonnegative_int("0") == 0
     assert nonnegative_int("1.2万") is None
+    assert display_count("1.2万") == (12000, True)
+    assert display_count("3亿") == (300000000, True)
+    assert display_count("42") == (42, False)
+    assert display_count("很多") == (None, False)
     return {"status": "passed", "network_used": False, "backend": AUTO_BACKEND}
 
 
@@ -1223,12 +1322,25 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default="auto",
         help="auto tries anonymous first and uses one read-only browser search only after an access-gate failure",
     )
+    search.add_argument(
+        "--opencli-profile",
+        help="Browser fallback only: connected Browser Bridge profile passed to OpenCLI as --profile",
+    )
     subparsers.add_parser("self-test", help="Run offline parser checks", allow_abbrev=False)
     args = parser.parse_args(argv)
     if args.command == "search":
         args.query = args.query.strip()
         if not args.query or len(args.query) > MAX_QUERY_LENGTH:
             parser.error(f"--query must contain 1 to {MAX_QUERY_LENGTH} characters")
+        if args.query.startswith("-"):
+            # The browser fallback passes the query positionally to OpenCLI.
+            parser.error("--query must not start with '-'")
+        if args.opencli_profile is not None and not OPENCLI_PROFILE_RE.fullmatch(
+            args.opencli_profile
+        ):
+            parser.error(
+                "--opencli-profile must be 1-64 letters, digits, '-' or '_', not starting with '-'"
+            )
         if not 1 <= args.limit <= MAX_RESULTS:
             parser.error(f"--limit must be between 1 and {MAX_RESULTS}")
         if not 1 <= args.max_pages <= MAX_PAGES:
@@ -1253,6 +1365,7 @@ def main(argv: list[str] | None = None) -> int:
         timeout=args.timeout,
         now=now_shanghai(),
         session_mode=args.session_mode,
+        opencli_profile=args.opencli_profile,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 2 if result["errors"] else 0

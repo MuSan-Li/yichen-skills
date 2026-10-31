@@ -49,7 +49,7 @@ class ContentArchiveContractTest(unittest.TestCase):
             "Agent 禁止自动使用兼容 `--overwrite`",
             "安全兼容 stub",
             "`login`、`search`、`download`",
-            "$yichen-wechat-mp-batch-exporter",
+            "`wechat_known_url.py`",
             "discovery_performed: false",
             "`xiaohongshu_fetch.py`",
             "`douyin_download.py`",
@@ -68,6 +68,7 @@ class ContentArchiveContractTest(unittest.TestCase):
             scripts,
             {
                 "wechat_mp_local.py",
+                "wechat_known_url.py",
                 "xiaoyuzhou_stepfun.py",
                 "xiaoyuzhou_opencli.py",
                 "x_known_url.py",
@@ -91,9 +92,7 @@ class ContentArchiveContractTest(unittest.TestCase):
             self.assertFalse(legacy.exists() or legacy.is_symlink(), str(legacy))
 
     def test_route_fixtures_are_closed(self):
-        allowed_skills = {
-            "wechat-mp-batch-exporter",
-        }
+        allowed_skills: set = set()
         allowed_backends = {
             "jina-reader",
             "web-reader",
@@ -109,6 +108,7 @@ class ContentArchiveContractTest(unittest.TestCase):
             "public-media-known-url",
             "youtube-known-url",
             "firecrawl-v2-bounded-site",
+            "wechat-known-url",
         }
         backend_markers = {
             "jina-reader": ("Jina Reader",),
@@ -128,6 +128,7 @@ class ContentArchiveContractTest(unittest.TestCase):
             "public-media-known-url": ("known_media_download.py",),
             "youtube-known-url": ("youtube_known_url.py",),
             "firecrawl-v2-bounded-site": ("firecrawl_site.py",),
+            "wechat-known-url": ("wechat_known_url.py",),
         }
         routable_decisions = {"route", "enumerate_then_route"}
         forbidden_branches = {
@@ -196,9 +197,9 @@ class ContentArchiveContractTest(unittest.TestCase):
 
     def test_wechat_retired_commands_fail_closed_before_side_effects(self):
         script = ROOT / "scripts" / "wechat_mp_local.py"
-        temp_root = Path(
-            tempfile.mkdtemp(prefix="wechat-mp-retired-contract-", dir="/tmp")
-        )
+        temp_dir = tempfile.TemporaryDirectory(prefix="wechat-mp-retired-contract-")
+        self.addCleanup(temp_dir.cleanup)
+        temp_root = Path(temp_dir.name)
         missing_input = temp_root / "must-not-be-read.txt"
         output_dir = temp_root / "must-not-be-created"
         commands = (
@@ -238,11 +239,8 @@ class ContentArchiveContractTest(unittest.TestCase):
                 self.assertFalse(payload["ok"])
                 self.assertEqual(payload["status"], "unsupported")
                 self.assertFalse(payload["side_effects_performed"])
-                self.assertEqual(
-                    payload["known_url_route"],
-                    "wechat-mp-batch-exporter",
-                )
-                self.assertIn("$yichen-wechat-mp-batch-exporter", payload["error"])
+                self.assertEqual(payload["known_url_route"], "wechat-known-url")
+                self.assertIn("wechat_known_url.py", payload["error"])
                 self.assertFalse(output_dir.exists())
 
     def test_wechat_stub_removes_retired_implementations(self):
@@ -312,7 +310,7 @@ class ContentArchiveContractTest(unittest.TestCase):
         self.assertNotIn("login_status", payload)
         self.assertNotIn("kv_directory_exists", payload)
 
-    def test_all_known_wechat_urls_route_to_batch_exporter(self):
+    def test_all_known_wechat_urls_route_to_known_url_executor(self):
         routed = [
             row
             for row in ROUTES
@@ -321,7 +319,8 @@ class ContentArchiveContractTest(unittest.TestCase):
         self.assertGreaterEqual(len(routed), 2)
         self.assertTrue(
             all(
-                row.get("route_skill") == "wechat-mp-batch-exporter"
+                row.get("route_backend") == "wechat-known-url"
+                and "route_skill" not in row
                 for row in routed
             )
         )

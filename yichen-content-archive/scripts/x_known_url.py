@@ -4,9 +4,11 @@
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import math
 import re
+import socket
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -26,6 +28,8 @@ ALLOWED_HOSTS = {
     "www.twitter.com",
     "mobile.twitter.com",
 }
+# Remote IDs are only used in API paths and local file names after this check.
+STATUS_ID_RE = re.compile(r"[1-9][0-9]{0,19}")
 
 
 class KnownUrlError(RuntimeError):
@@ -69,7 +73,7 @@ def parse_known_url(value: str) -> dict[str, str | None]:
         )
 
     status_match = re.fullmatch(
-        r"/(?P<handle>[^/]+)/status/(?P<id>\d+)(?:/.*)?",
+        r"/(?P<handle>[^/]+)/status/(?P<id>[0-9]+)(?:/.*)?",
         parsed.path.rstrip("/"),
     )
     if status_match:
@@ -84,7 +88,7 @@ def parse_known_url(value: str) -> dict[str, str | None]:
         }
 
     web_status_match = re.fullmatch(
-        r"/i/(?:web/)?status/(?P<id>\d+)(?:/.*)?",
+        r"/i/(?:web/)?status/(?P<id>[0-9]+)(?:/.*)?",
         parsed.path.rstrip("/"),
     )
     if web_status_match:
@@ -96,7 +100,7 @@ def parse_known_url(value: str) -> dict[str, str | None]:
         }
 
     article_match = re.fullmatch(
-        r"/i/article/(?P<id>\d+)(?:/.*)?",
+        r"/i/article/(?P<id>[0-9]+)(?:/.*)?",
         parsed.path.rstrip("/"),
     )
     if article_match:
@@ -118,6 +122,19 @@ def read_limited(response: Any, limit: int) -> bytes:
     if len(body) > limit:
         raise KnownUrlError("response_too_large", "The public response was too large.")
     return body
+
+
+def is_timeout_error(exc: BaseException) -> bool:
+    # Python 3.9: socket.timeout is not a TimeoutError subclass, and a timeout while
+    # waiting for headers or reading the body is raised unwrapped (not as URLError).
+    reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+    return isinstance(reason, (socket.timeout, TimeoutError))
+
+
+def transport_error(exc: BaseException, service: str) -> KnownUrlError:
+    if is_timeout_error(exc):
+        return KnownUrlError("timeout", f"{service} did not respond before the timeout.")
+    return KnownUrlError("network_error", f"{service} could not be reached.")
 
 
 def fetch_json(path: str, *, query: dict[str, str | int] | None, timeout: int) -> dict:
@@ -142,11 +159,9 @@ def fetch_json(path: str, *, query: dict[str, str | int] | None, timeout: int) -
             category,
             f"FxTwitter returned HTTP {exc.code}.",
         ) from exc
-    except (urllib.error.URLError, TimeoutError) as exc:
-        raise KnownUrlError(
-            "network_error",
-            "FxTwitter could not be reached.",
-        ) from exc
+    except (OSError, http.client.HTTPException) as exc:
+        # URLError, socket.timeout and connection resets are OSError subclasses.
+        raise transport_error(exc, "FxTwitter") from exc
     try:
         payload = json.loads(body)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -1049,11 +1064,23 @@ def require_status_identity(
 
 
 def resolve_article(article_id: str, *, timeout: int) -> dict[str, Any]:
-    search = fetch_json(
-        "/search",
-        query={"q": article_id, "feed": "latest", "count": 10},
-        timeout=timeout,
-    )
+    try:
+        search = fetch_json(
+            "/search",
+            query={"q": article_id, "feed": "latest", "count": 10},
+            timeout=timeout,
+        )
+    except KnownUrlError as exc:
+        # FxTwitter answers HTTP 404 for every /2/search query while its search
+        # index is unavailable (seen 2026-10-31, even for "q=test"). That says
+        # nothing about whether the Article exists, so it must not read as not_found.
+        if exc.category != "not_found":
+            raise
+        raise KnownUrlError(
+            "article_index_unavailable",
+            "FxTwitter search returned HTTP 404, so the Article's parent status could not "
+            "be resolved anonymously; pass the parent x.com/<handle>/status/<id> URL instead.",
+        ) from exc
     parent = find_article_parent(search.get("results"), article_id)
     if parent is None:
         raise KnownUrlError(
@@ -1061,10 +1088,10 @@ def resolve_article(article_id: str, *, timeout: int) -> dict[str, Any]:
             "The public index did not return an exact parent status for this Article ID.",
         )
     status_id = text_or_none(parent.get("id"))
-    if status_id is None:
+    if status_id is None or not STATUS_ID_RE.fullmatch(status_id):
         raise KnownUrlError(
             "invalid_response",
-            "The exact Article match did not contain a parent status ID.",
+            "The exact Article match did not contain a valid parent status ID.",
         )
     resolved = fetch_status(status_id, timeout=timeout)
     require_status_identity(
@@ -1089,8 +1116,10 @@ def fetch_jina(status_url: str, *, timeout: int) -> str:
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             body = read_limited(response, MAX_MARKDOWN_BYTES)
-    except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as exc:
+    except urllib.error.HTTPError as exc:
         raise KnownUrlError("jina_unavailable", "Jina Reader could not read the status.") from exc
+    except (OSError, http.client.HTTPException) as exc:
+        raise transport_error(exc, "Jina Reader") from exc
     try:
         markdown = body.decode("utf-8").strip()
     except UnicodeDecodeError as exc:
@@ -1241,13 +1270,23 @@ def read_known_url(
             )
 
     success = normalized is not None or jina_markdown is not None
+    # Jina text cannot be audited against the Article's DraftJS blocks, so for an
+    # Article it is at most partial and the authorized fallback plan is kept.
     complete = bool(
         normalized
         and (
             not is_article
             or projected_article_body_complete(normalized)
         )
-    ) or bool(jina_markdown)
+    ) or bool(jina_markdown and not is_article)
+    if jina_markdown and is_article and not complete:
+        errors.append(
+            {
+                "backend": "jina-reader",
+                "category": "article_body_unverified",
+                "message": "Jina Reader text for an X Article is not verified as the full body.",
+            }
+        )
     return {
         "schema_version": "1.0",
         "status": "success" if complete else "partial" if success else "failed",

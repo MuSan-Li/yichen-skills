@@ -77,6 +77,11 @@ jobs:
           python -m py_compile yichen-unified-search/tests/*.py
           python -m py_compile yichen-web-research/scripts/*.py
           python -m py_compile yichen-web-research/tests/*.py
+          python -m py_compile yichen-content-archive/scripts/*.py
+          python -m py_compile yichen-content-archive/tests/*.py
+          python -m py_compile yichen-asr/scripts/*.py
+          python -m py_compile yichen-asr/scripts/backends/*.py
+          python -m py_compile yichen-asr/tests/*.py
 
       - name: Run unified-search contracts
         run: |
@@ -99,6 +104,11 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y ffmpeg
+
+      - name: Run ASR and bookmark-export contracts
+        run: |
+          python -m unittest discover -s yichen-asr/tests -p 'test_*.py'
+          python -m unittest discover -s yichen-bookmarks-export/tests -p 'test_*.py'
 
       - name: Run X source and media contracts
         run: node yichen-x-slicer/scripts/test.mjs
@@ -127,6 +137,8 @@ jobs:
               Path('plugins/yichen-grok-consult'),
               Path('yichen-codex-chatgpt'),
               Path('yichen-content-archive'),
+              Path('yichen-asr'),
+              Path('yichen-bookmarks-export'),
               Path('yichen-agent-memory'),
               Path('yichen-x-slicer'),
               Path('yichen-mac-wechat-dual-open'),

@@ -361,6 +361,17 @@ def main() -> int:
     router_source = (
         SKILLS_ROOT / "yichen-web-research/SKILL.md"
     ).read_text(encoding="utf-8")
+    router_description = re.search(
+        r"(?m)^description:\s*(.+)$", router_source.split("---", 2)[1]
+    )
+    # The horizontal/longitudinal execution steps live in this contract, linked from SKILL.md.
+    hengzong_contract_source = (
+        SKILLS_ROOT / "yichen-web-research/references/hengzong-execution-contract.md"
+    ).read_text(encoding="utf-8")
+    # Backend notes (Firecrawl, Zhihu) live in the doctor reference, linked from SKILL.md.
+    readiness_source = (
+        SKILLS_ROOT / "yichen-web-research/references/backend-readiness.md"
+    ).read_text(encoding="utf-8")
     hengzong_scripts = {
         name: SKILLS_ROOT / "yichen-web-research/scripts" / name
         for name in (
@@ -376,8 +387,13 @@ def main() -> int:
         "opencli ",
     )
     router_metadata_checks = {
-        "english_trigger_present": "Use when an internet-research request"
-        in router_source,
+        "description_scopes_multistage_research": bool(
+            router_description
+            and all(
+                marker in router_description.group(1)
+                for marker in ("多阶段互联网研究", "横纵研究", "单次搜索", "已知链接读取")
+            )
+        ),
         "all_child_names_present": all(
             name in router_source
             for name in (
@@ -387,14 +403,18 @@ def main() -> int:
                 "yichen-asr",
             )
         ),
-        "research_references_match_supported_operations": {
+        "references_are_bounded": {
             path.name
             for path in (
                 SKILLS_ROOT / "yichen-web-research/references"
             ).glob("*")
             if path.is_file()
         }
-        == {"hengzong-research.md", "hengzong-execution-contract.md", "backend-readiness.md"},
+        == {
+            "backend-readiness.md",
+            "hengzong-execution-contract.md",
+            "hengzong-research.md",
+        },
         "router_scripts_are_bounded": {
             path.name
             for path in (
@@ -438,7 +458,7 @@ def main() -> int:
         "archive_is_explicit_conditional_branch": (
             "仅在用户明确要求归档且范围已限定时" in router_source
             and "搜索结束后不得自动归档或下载" in router_source
-            and "只有用户明确要求持久化原文或下载媒体" in router_source
+            and "只有用户明确要求持久化原文或下载媒体" in hengzong_contract_source
         ),
         "workstreams_have_bounded_scope_query_groups": all(
             marker in planner_source
@@ -595,14 +615,13 @@ def main() -> int:
             and "FxTwitter" in boundary_sources["search"]
         ),
         "firecrawl_is_explicit_and_bounded": (
-            "不进入默认搜索链" in router_source
-            and "同源" in router_source
-            and "最多 100 条" in router_source
+            "不进入默认搜索链" in readiness_source
+            and "路径、页数和深度" in router_source
             and "Firecrawl" in boundary_sources["search"]
         ),
         "zhihu_is_explicit_public_only": (
-            "显式 `zhihu` 平台后端" in router_source
-            and "global_search" in router_source
+            "显式 `zhihu` 平台后端" in readiness_source
+            and "global_search" in readiness_source
             and "zhihu_adapter.py" in boundary_sources["search"]
         ),
         "bookmarks_requires_current_turn_authorization": "当轮授权"
@@ -618,7 +637,7 @@ def main() -> int:
             in router_source
         ),
         "search_completion_does_not_authorize_archive": (
-            "搜索完成本身绝不转移归档授权" in router_source
+            "搜索完成本身绝不转移归档授权" in hengzong_contract_source
             and "仅在用户明确要求归档且范围已限定时" in router_source
         ),
         "public_opinion_excludes_generic_search": (

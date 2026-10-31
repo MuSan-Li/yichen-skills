@@ -17,3 +17,5 @@ python3 ~/.agents/skills/yichen-content-archive/scripts/firecrawl_site.py \
 ```
 
 执行器只接受公开 HTTPS。域名固定使用 `idna` 3.x 的 UTS46 non-transitional + STD3 规范化；依赖不可用时只允许 ASCII 域名继续，绝不回退到 Python 内置 IDNA2003。规范化前拒绝 percent-encoded 主机，规范化后继续拒绝特殊用途 DNS、私网/本地地址和 WHATWG legacy IPv4 表示。`path-prefix` 必须显式非空（只有显式 `/` 才代表整站），路径按有限轮次严格解码到稳定，并拒绝 malformed percent escape、任意层级编码的 slash/backslash 和 dot segment。禁止子域、外域、登录态、目标站 headers、actions、TLS 跳过和 monitor。Firecrawl API 请求固定 v2 且拒绝所有重定向，避免 Bearer Key 被带到其他 origin。Crawl 固定 `allowSubdomains=false`、`allowExternalLinks=false`、`ignoreRobotsTxt=false`、`crawlEntireDomain=false`，并固定 `scrapeOptions.storeInCache=false`、`proxy=basic`、`skipTlsVerification=false`。不得传 `zeroDataRetention=true`；`storeInCache=false` 不能表述为绝对零留存。Firecrawl Key 只从 `FIRECRAWL_API_KEY` 或 `~/.config/agent-secrets/firecrawl-api-key` 读取，不回显、不进入普通日志。Map/Crawl 审计同时记录 `map_requests=1`、`crawl_page_cap=limit` 和 `pricing_must_be_rechecked=true`；这是额度暴露上限，不是固定价格承诺。
+
+同一份 preflight 只能执行一次 Crawl；执行后源 Map run 内会出现 `preflight.consumed.json`，再次执行报 `preflight_already_used`，需要重新运行 Map 生成新的 preflight。Crawl 结果只归档 sourceURL 与最终 url 都在范围内且状态码为 2xx 的页面；翻页中途失败时已得页面保留并标 `partial`。

@@ -27,7 +27,7 @@
 | 搜索方向 | 具体能力 | 使用限制 |
 |---|---|---|
 | 公共网页与垂直领域 | 通过 AnySearch 搜索概念、教程、产品、行业资料；支持批量查询与垂直搜索 | 垂直领域先确认可用子域和必填参数；通用搜索的时间条件仍需原文核对 |
-| AI 最新动态 | 通过 AI HOT 查找近期 AI 新闻与发布动态，多主题合并、去重并记录各主题覆盖 | items 路线最多 7 天、最多 5 个主题；不会把滚动窗口当成精确日期筛选 |
+| AI 最新动态 | 通过 AI HOT 查找近期 AI 新闻、日报与分类条目，多主题合并、去重并记录各主题覆盖；需要完整时间窗时可翻页取全 | items 路线最多 7 天、最多 5 个主题；不会把滚动窗口当成精确日期筛选 |
 | 平台站内发现 | 按路由使用 YouTube、GitHub、B站、公众号、小红书、抖音、头条、小宇宙、知乎、微博和 X 等适配器 | 各平台依赖不同；支持的平台名称不代表任意环境都可执行 |
 | X Quick / Research | Grok 原生 X 搜索优先；Quick 做有界查询，Research 拆成多个聚焦查询并按波次补充与去重 | Quick 每个查询最多 20 条、1–7 天；Research 至少 3 个聚焦查询，最多 40 次外层搜索、最多补搜一轮 |
 | 站点 URL Map | 显式要求时用 Firecrawl 枚举公开站点指定路径下的链接 | 最多 100 条同源、同路径范围候选；不等于抓取全文或归档 |
@@ -66,10 +66,10 @@
 | 小红书 | 读取已知笔记的 HTML 和元数据；明确要求时下载笔记图片或视频；写入飞书需要单独的明确请求 |
 | 抖音 | 读取已知视频元数据，或按请求下载视频 |
 | 微博 | 规范化单条内容链接后匿名读取或下载，不枚举账号视频页、热榜、评论或推荐 |
-| 微信公众号 | 通过 `yichen-wechat-mp-batch-exporter` 处理已知公开文章 URL 或 URL 文件；不支持按账号名搜索、完整历史或最新 N 篇枚举 |
+| 微信公众号 | 用自带的 `wechat_known_url.py` 匿名读取或下载已知公开文章 URL 或 URL 文件（支持图文页，正文图片存到本地）；不支持按账号名搜索、完整历史或最新 N 篇枚举，这些交给 `yichen-wechat-mp-batch-exporter` |
 | YouTube | 读取视频信息、下载媒体、提取字幕及枚举明确给出的播放列表；不做搜索或浏览频道 |
 | B站 | 读取已知 BV/AV/完整链接，按请求下载；已知播放列表先生成条目清单 |
-| 小宇宙 | 读取或下载已知 episode；明确播客容器的条目枚举按对应授权规则执行 |
+| 小宇宙 | 读取或下载已知 episode，按请求经 `yichen-asr` 转写（批量 StepFun 须声明数量上限）；明确播客容器的条目枚举按对应授权规则执行 |
 | 其他公开媒体 | 对明确给出的单条公开 HTTPS 内容 URL，尝试匿名 `yt-dlp --no-playlist` 下载；无法支持时如实标记 |
 | 有界公开站点 | 指定 HTTPS 站点、精确路径、页数与深度；先生成 Map 签名预检，再经明确执行授权调用 Crawl |
 
@@ -129,16 +129,16 @@
 
 ### 能做什么
 
-接收已有本地音频或视频，根据输出需求在 Step ASR 与火山引擎豆包 ASR 之间选择后端，先体检配置，再执行或恢复任务。它是转写路由层，不是第三套语音识别引擎。
+接收已有本地音频或视频，在 Step ASR、火山引擎豆包 ASR 与免费的本地 Whisper 之间选择后端，先体检配置，再执行或恢复任务。原 `yichen-volc-asr` 已并入本 Skill。
 
 | 需求 | 默认路线 | 产物与说明 |
 |---|---|---|
-| 全文转写，供摘要或内容分析使用 | Step ASR | 以分块转写文本为主；兼容执行器支持 30 秒切片，失败片段可缩小为 10/5 秒重试 |
-| 较细的时间戳与 SRT 字幕 | 豆包 ASR | 使用结构化 utterances 和时间信息生成文字与字幕 |
-| 口播停顿、填充词分析及粗剪 | 豆包 ASR 配合既有 ffmpeg 链 | 可生成分析与剪辑命令；实际剪辑按请求执行，不等于完整的创意成片制作 |
-| 明确指定“只用 Step”或“只用豆包” | 用户指定后端 | 失败后报告原后端的恢复路径，不静默换服务商 |
+| 全文转写，供摘要或内容分析使用 | `transcribe.py`：StepFun，或已保存偏好中的本地 Whisper | StepFun 以 30 秒切片，失败片段可缩小为 10/5 秒重试；Whisper 免费、较慢，只有分段时间 |
+| 逐字时间戳与 SRT 字幕 | Step 国内站时间戳执行器 | 逐字毫秒时间戳；Step 被拒且未产生费用时，自动路由可在重新提交前改用豆包 2.0 |
+| 口播停顿、填充词分析及粗剪 | Step 时间戳结果，或显式指定的豆包 ASR 配合 ffmpeg 链 | 可生成分析与剪辑命令；实际剪辑按请求执行，不等于完整的创意成片制作 |
+| 明确指定“只用 Step”“只用豆包”或“用 Whisper” | 用户指定后端 | 失败后报告原后端的恢复路径，不静默换服务商 |
 
-公开版不内置 Step 执行器，需要配置 `YICHEN_STEP_ASR_SCRIPT` 或安装兼容的同级执行器。豆包路线依赖 `yichen-volc-asr`、用户自己的凭据和适用的 ffmpeg 环境。
+公开版不内置 Step 执行器，需要用 `YICHEN_STEP_ASR_SCRIPT`、`YICHEN_STEP_ASR_TIMESTAMPS_SCRIPT` 指向兼容执行器。豆包执行器随 `yichen-asr/scripts/backends/` 发布，依赖用户自己的 App ID、Token、TOS bucket 和 ffmpeg 环境；它会把工作副本设为公开读后提交识别。首次未保存引擎偏好时，会先提示在付费 StepFun 与本地 Whisper 之间选择一次。
 
 ### 输出与适用示例
 
@@ -152,7 +152,7 @@
 
 **边界：** 不搜索和下载视频。媒体会按所选后端提交给服务商；批量或可能显著消耗额度时，先说明文件数、总时长和服务商。配置了 Token 不代表账户有余额；一旦某家已经接收任务或产生 request ID，就优先恢复原任务，不向另一家重复提交同一媒体。
 
-详见：[ASR 执行规则](../yichen-asr/SKILL.md) · [豆包底层执行器](../yichen-volc-asr/SKILL.md)。
+详见：[ASR 执行规则](../yichen-asr/SKILL.md) · [豆包执行器与粗剪](../yichen-asr/references/doubao-asr.md) · [Step 执行器约定](../yichen-asr/references/step-asr.md)。
 
 ## 如何组合成一次研究
 
@@ -265,12 +265,14 @@ The family can use capabilities that are not bundled here:
 - `gh`, `yt-dlp`, `bili`, OpenCLI, Grok CLI, and `xreach`
 - the `yichen-grok-consult` plugin for Grok-first native X search, with anonymous
   FxTwitter fallback only after explicit Grok account-quota exhaustion
-- `yichen-wechat-mp-batch-exporter`; private bookmark collectors are bundled in
-  `yichen-bookmarks-export`, while Xiaohongshu and Douyin known-link fetchers are bundled in `yichen-content-archive`
-- `yichen-volc-asr`, `ffmpeg`, and an optional compatible Step ASR executor
-- WeChat public-article processing through `yichen-wechat-mp-batch-exporter` for
-  known article URLs only; account-name search and account-history enumeration
-  are unsupported
+- private bookmark collectors are bundled in `yichen-bookmarks-export`, while
+  Xiaohongshu, Douyin, and WeChat Official Account known-link fetchers are
+  bundled in `yichen-content-archive`
+- `ffmpeg`, plus optional compatible Step ASR executors or a local Whisper CLI
+  for `yichen-asr`; its Doubao executor is bundled
+- `yichen-wechat-mp-batch-exporter` only for WeChat account history, metrics,
+  or comments; account-name search and history enumeration are not part of
+  this family
 
 Missing optional backends reduce coverage; they do not relax authorization
 rules or trigger automatic installation.
@@ -292,13 +294,16 @@ backends you use:
 | `YICHEN_ANYSEARCH_RUNTIME_CONF` | Override the AnySearch `runtime.conf` path |
 | `OPENCLI_HOME` | Override the OpenCLI state directory |
 | `YICHEN_XIAOYUZHOU_CREDENTIAL_FILE` | Override the Xiaoyuzhou OpenCLI credential-file location |
-| `YICHEN_STEP_ASR_SCRIPT` | Path to an independently installed Step ASR executor |
+| `YICHEN_STEP_ASR_SCRIPT` | Path to an independently installed Step ASR text executor |
+| `YICHEN_STEP_ASR_TIMESTAMPS_SCRIPT` | Path to an independently installed Step China-site timestamp executor |
 | `FIRECRAWL_API_KEY` | Optional Firecrawl API key; the doctor checks only whether it is non-empty |
 | `FIRECRAWL_KEY_FILE` | Optional private Firecrawl key file; the doctor checks metadata only and never reads it |
 | `ZHIHU_CLI` | Override the separately installed Zhihu CLI-compatible executable path |
-| `YICHEN_DOUBAO_ASR_SCRIPT` | Override the bundled `yichen-volc-asr` executor path |
+| `YICHEN_DOUBAO_ASR_SCRIPT` | Override the bundled `yichen-asr/scripts/backends/volc_asr_transcribe.py` executor path |
+| `YICHEN_ASR_ENGINE` | Override the `yichen-asr` engine library that content archive loads for Xiaoyuzhou transcription |
 | `VOLC_ASR_TRIAL_APP_ID` / `VOLC_ASR_PAID_APP_ID` | User-owned Volcengine application IDs |
 | `VOLC_ASR_TRIAL_TOKEN` / `VOLC_ASR_PAID_TOKEN` | User-owned Volcengine tokens |
+| `TOS_ACCESS_KEY` / `TOS_SECRET_KEY` / `TOS_BUCKET` | User-owned Volcengine TOS upload settings for the Doubao executor |
 | `WECHAT_ARTICLE_EXPORTER_KV` | Local exporter state directory |
 | `GROK_CLI` | Override the Grok executable path |
 | `GROK_AUTH_FILE` | Override the Grok local authentication-status file path |
@@ -330,8 +335,10 @@ Never commit the values of credential variables or local state files.
 - Existing artifacts are not overwritten or deleted by default.
 
 The Xiaoyuzhou helper accepts only HTTPS episode pages on
-`xiaoyuzhoufm.com` and audio on `xyzcdn.net`. The legacy local WeChat helper is
-a fail-closed compatibility stub, not a login, search, or download backend.
+`xiaoyuzhoufm.com` and audio on `media.xyzcdn.net`; it transcribes only through
+`yichen-asr` (StepFun by default, `--download-only` to skip transcription). The legacy local WeChat helper is a
+fail-closed compatibility stub, not a login, search, or download backend; known
+WeChat article links use the anonymous `wechat_known_url.py` reader instead.
 
 ## Validation
 

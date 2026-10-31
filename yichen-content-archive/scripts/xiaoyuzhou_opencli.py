@@ -10,11 +10,14 @@ import re
 import shutil
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
 
 
-ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
+# IDs are passed to OpenCLI as positional arguments, so a leading "-" is never allowed.
+ID_PATTERN = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_-]*$")
+XIAOYUZHOU_HOSTS = frozenset({"xiaoyuzhoufm.com", "www.xiaoyuzhoufm.com"})
 OPENCLI_HOME = Path(
     os.environ.get("OPENCLI_HOME", str(Path.home() / ".opencli"))
 ).expanduser()
@@ -24,6 +27,8 @@ CREDENTIAL_FILE = Path(
         str(OPENCLI_HOME / "xiaoyuzhou.json"),
     )
 ).expanduser()
+# Each default run gets a new timestamped directory below this parent.
+DEFAULT_OUTPUT_PARENT = Path.home() / "Downloads" / "xiaoyuzhou-opencli"
 
 
 def add_authorization_flag(parser: argparse.ArgumentParser) -> None:
@@ -58,7 +63,7 @@ def build_parser() -> argparse.ArgumentParser:
     episodes.add_argument("--limit", type=int, default=20)
     episodes.add_argument(
         "--output-dir",
-        help="Defaults to a new non-conflicting directory under /tmp",
+        help="Defaults to a new timestamped directory under ~/Downloads/xiaoyuzhou-opencli",
     )
     episodes.add_argument(
         "--overwrite",
@@ -71,7 +76,10 @@ def build_parser() -> argparse.ArgumentParser:
     episodes.add_argument(
         "--confirm-overwrite-exact-dir",
         default="",
-        help="High-friction confirmation: repeat the exact absolute --output-dir path",
+        help=(
+            "High-friction confirmation: repeat the absolute --output-dir exactly as "
+            "passed (its resolved real path is also accepted)"
+        ),
     )
     add_authorization_flag(episodes)
 
@@ -113,7 +121,12 @@ def build_parser() -> argparse.ArgumentParser:
 def normalize_id(value: str, kind: str) -> str:
     candidate = value.strip()
     if "/" in candidate:
-        parts = [part for part in urlparse(candidate).path.split("/") if part]
+        parsed = urlparse(candidate)
+        if parsed.scheme or parsed.netloc:
+            host = (parsed.hostname or "").lower().rstrip(".")
+            if parsed.scheme not in {"http", "https"} or host not in XIAOYUZHOU_HOSTS:
+                raise ValueError(f"不是小宇宙 {kind} 链接")
+        parts = [part for part in parsed.path.split("/") if part]
         if kind not in parts:
             raise ValueError(f"不是小宇宙 {kind} 链接")
         index = parts.index(kind)
@@ -197,10 +210,16 @@ def validate_overwrite_authorization(
     if not output_arg:
         raise ValueError("--overwrite 必须同时显式提供 --output-dir")
     target = Path(output_arg).expanduser().resolve()
-    if not target.is_absolute() or confirmation != str(target):
+    # Accept the absolute path exactly as the user typed it, or its resolved real
+    # path (macOS maps /tmp to /private/tmp); nothing looser.
+    accepted = {str(target)}
+    if os.path.isabs(output_arg):
+        accepted.add(output_arg)
+    if not target.is_absolute() or confirmation not in accepted:
         raise ValueError(
             "--overwrite 需要独立高摩擦确认："
-            "--confirm-overwrite-exact-dir 必须逐字等于解析后的绝对 --output-dir"
+            "--confirm-overwrite-exact-dir 必须逐字等于原样传入的绝对 --output-dir"
+            "（或其解析后的真实路径）"
         )
     return target
 
@@ -246,15 +265,30 @@ def write_text(path: Path, content: str, *, overwrite: bool) -> None:
         raise FileExistsError(f"输出文件已存在，默认排他创建拒绝覆盖: {path}") from exc
 
 
+def default_output_base(label: str) -> Path:
+    stamp = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
+    return DEFAULT_OUTPUT_PARENT / f"{label}-{stamp}"
+
+
 def export_episodes(
     podcast_id: str,
     rows: object,
     output_dir: Path,
     *,
     overwrite: bool,
+    limit: int | None = None,
 ) -> dict[str, object]:
     if not isinstance(rows, list):
         raise RuntimeError("OpenCLI 节目列表格式异常：预期 JSON 数组")
+    # OpenCLI returns no total count: fewer rows than the cap means complete,
+    # exactly the cap means more may exist, and extra rows are cut to the cap.
+    truncated: bool | None = None
+    if limit is not None:
+        if len(rows) > limit:
+            rows = rows[:limit]
+            truncated = True
+        elif len(rows) < limit:
+            truncated = False
     episode_ids: list[str] = []
     for index, row in enumerate(rows, start=1):
         if not isinstance(row, dict) or not row.get("eid"):
@@ -268,8 +302,13 @@ def export_episodes(
     json_path = output_dir / "episodes.json"
     ids_path = output_dir / "episode_ids.txt"
     urls_path = output_dir / "episode_urls.txt"
+    manifest_path = output_dir / "enumeration.json"
     if not overwrite:
-        existing = [str(path) for path in (json_path, ids_path, urls_path) if path.exists()]
+        existing = [
+            str(path)
+            for path in (json_path, ids_path, urls_path, manifest_path)
+            if path.exists()
+        ]
         if existing:
             raise FileExistsError(
                 "输出文件已存在，改用新目录或显式传入 --overwrite: " + ", ".join(existing)
@@ -285,13 +324,37 @@ def export_episodes(
         "".join(f"https://www.xiaoyuzhoufm.com/episode/{eid}\n" for eid in episode_ids),
         overwrite=overwrite,
     )
+    manifest = {
+        "schema_version": "1.0",
+        "platform": "xiaoyuzhou",
+        "backend": "xiaoyuzhou-opencli",
+        "container_kind": "xiaoyuzhou_podcast",
+        "container_id": podcast_id,
+        "container_ref": f"https://www.xiaoyuzhoufm.com/podcast/{podcast_id}",
+        "requested_limit": limit,
+        "returned_count": len(episode_ids),
+        "known_total": None,
+        "truncated": truncated,
+        "login_state_used": True,
+        "enumerated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "episode_urls": str(urls_path),
+    }
+    write_text(
+        manifest_path,
+        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+        overwrite=overwrite,
+    )
     return {
         "event": "EPISODES_EXPORTED",
         "podcast_id": podcast_id,
         "count": len(episode_ids),
+        "requested_limit": limit,
+        "returned_count": len(episode_ids),
+        "truncated": truncated,
         "episodes_json": str(json_path),
         "episode_ids": str(ids_path),
         "episode_urls": str(urls_path),
+        "enumeration_manifest": str(manifest_path),
     }
 
 
@@ -361,14 +424,16 @@ def main(argv: list[str] | None = None) -> int:
             pid = normalize_id(args.id, "podcast")
             output_dir = prepare_output_dir(
                 args.output_dir,
-                Path(f"/tmp/xiaoyuzhou-opencli-{pid}"),
+                default_output_base(f"episodes-{pid}"),
                 overwrite=args.overwrite,
                 confirmation=args.confirm_overwrite_exact_dir,
             )
             rows = run_opencli_json(
                 ["xiaoyuzhou", "podcast-episodes", pid, "--limit", str(args.limit)]
             )
-            report = export_episodes(pid, rows, output_dir, overwrite=args.overwrite)
+            report = export_episodes(
+                pid, rows, output_dir, overwrite=args.overwrite, limit=args.limit
+            )
             status = 0
         elif args.command == "episode":
             eid = normalize_id(args.id, "episode")
@@ -382,7 +447,7 @@ def main(argv: list[str] | None = None) -> int:
             eid = normalize_id(args.id, "episode")
             output_dir = prepare_output_dir(
                 args.output_dir,
-                Path(f"/tmp/xiaoyuzhou-opencli-{args.command}-{eid}"),
+                default_output_base(f"{args.command}-{eid}"),
             )
             report = {
                 "event": "DOWNLOADED" if args.command == "download" else "TRANSCRIPT_DOWNLOADED",
@@ -398,7 +463,7 @@ def main(argv: list[str] | None = None) -> int:
             action = "download" if args.command == "batch-download" else "transcript"
             output_dir = prepare_output_dir(
                 args.output_dir,
-                Path(f"/tmp/xiaoyuzhou-opencli-batch-{action}"),
+                default_output_base(f"batch-{action}"),
             )
             report, status = run_batch(action, episode_ids, output_dir)
     except Exception as exc:
