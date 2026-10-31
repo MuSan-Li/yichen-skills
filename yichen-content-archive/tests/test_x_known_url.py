@@ -1,7 +1,10 @@
+import http.client
 import importlib.util
 import pathlib
+import socket
 import sys
 import unittest
+import urllib.error
 from unittest import mock
 
 
@@ -367,7 +370,9 @@ class KnownXUrlTests(unittest.TestCase):
             ],
         )
 
-    def test_status_article_with_incomplete_body_uses_jina(self):
+    def test_status_article_with_incomplete_body_and_jina_text_stays_partial(self):
+        # Jina text cannot be audited against the DraftJS body, so it never makes
+        # an incomplete Article "success" or drops the authorized fallback plan.
         status = {
             "type": "status",
             "id": "2000000000000000001",
@@ -392,11 +397,152 @@ class KnownXUrlTests(unittest.TestCase):
                 timeout=30,
                 allow_jina_fallback=True,
             )
-        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["status"], "partial")
         self.assertEqual(result["content"]["content_type"], "x_article")
         self.assertEqual(result["route"]["backend_used"], "jina-reader")
+        self.assertEqual(result["jina_markdown"], "# Public article fallback")
         jina.assert_called_once_with(status["url"], timeout=30)
+        self.assertEqual(
+            [error["category"] for error in result["errors"]],
+            ["article_body_incomplete", "article_body_unverified"],
+        )
+        fallbacks = result["authenticated_fallbacks"]
+        self.assertEqual(
+            [item["backend"] for item in fallbacks], ["opencli-twitter", "xreach"]
+        )
+        self.assertEqual(
+            fallbacks[0]["argv"],
+            ["opencli", "twitter", "article", status["url"], "-f", "md"],
+        )
+        self.assertTrue(
+            all(item["requires_current_turn_authorization"] for item in fallbacks)
+        )
+
+    def test_article_url_resolves_parent_with_one_exact_search(self):
+        article_id = "2032093606551707648"
+        parent_id = "1888888888888888888"
+        article = {
+            "id": article_id,
+            "title": "Full article",
+            "content": {
+                "blocks": [{"type": "unstyled", "text": "Body", "entityRanges": []}],
+                "entityMap": [],
+            },
+            "media_entities": [],
+        }
+        calls = []
+
+        def fake_fetch_json(path, *, query, timeout):
+            calls.append((path, query))
+            if path == "/search":
+                return {"code": 200, "results": [status(id=parent_id, article={"id": article_id})]}
+            return {"code": 200, "status": status(id=parent_id, article=article)}
+
+        with mock.patch.object(
+            XURL, "fetch_json", side_effect=fake_fetch_json
+        ), mock.patch.object(XURL, "fetch_jina") as jina:
+            result = XURL.read_known_url(
+                f"https://x.com/i/article/{article_id}",
+                timeout=30,
+                allow_jina_fallback=True,
+            )
+        self.assertEqual(
+            calls,
+            [
+                ("/search", {"q": article_id, "feed": "latest", "count": 10}),
+                (f"/status/{parent_id}", None),
+            ],
+        )
+        jina.assert_not_called()
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["content"]["content_type"], "x_article")
+        self.assertEqual(result["content"]["article"]["body_markdown"], "Body")
         self.assertEqual(result["authenticated_fallbacks"], [])
+
+    def test_article_parent_id_from_search_is_validated_before_any_path_use(self):
+        article_id = "2032093606551707648"
+        for parent_id in ("1/../../escaped", "0", "-1", "１２３", "1" * 21, "12a"):
+            with self.subTest(parent_id=parent_id), mock.patch.object(
+                XURL,
+                "fetch_json",
+                return_value={
+                    "code": 200,
+                    "results": [{"id": parent_id, "article": {"id": article_id}}],
+                },
+            ) as search, mock.patch.object(XURL, "fetch_status") as fetch_status:
+                with self.assertRaises(XURL.KnownUrlError) as raised:
+                    XURL.resolve_article(article_id, timeout=30)
+            self.assertEqual(raised.exception.category, "invalid_response")
+            search.assert_called_once()
+            fetch_status.assert_not_called()
+
+    def test_failed_article_url_returns_only_article_fallback(self):
+        with mock.patch.object(
+            XURL,
+            "fetch_json",
+            side_effect=XURL.KnownUrlError("rate_limited", "FxTwitter returned HTTP 429."),
+        ), mock.patch.object(XURL, "fetch_jina") as jina:
+            result = XURL.read_known_url(
+                "https://x.com/i/article/2032093606551707648",
+                timeout=30,
+                allow_jina_fallback=True,
+            )
+        jina.assert_not_called()
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["errors"][0]["category"], "rate_limited")
+        self.assertEqual(
+            [item["argv"][:3] for item in result["authenticated_fallbacks"]],
+            [["opencli", "twitter", "article"]],
+        )
+
+    def test_article_search_404_is_index_unavailable_not_not_found(self):
+        # Live 2026-10-31: /2/search answered HTTP 404 for every query, even "test".
+        with mock.patch.object(
+            XURL,
+            "fetch_json",
+            side_effect=XURL.KnownUrlError("not_found", "FxTwitter returned HTTP 404."),
+        ) as search, mock.patch.object(XURL, "fetch_status") as fetch_status, mock.patch.object(
+            XURL, "fetch_jina"
+        ) as jina:
+            result = XURL.read_known_url(
+                "https://x.com/i/article/2032093606551707648",
+                timeout=30,
+                allow_jina_fallback=True,
+            )
+        search.assert_called_once()
+        fetch_status.assert_not_called()
+        jina.assert_not_called()
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["errors"][0]["category"], "article_index_unavailable")
+        self.assertIn("/status/", result["errors"][0]["message"])
+        self.assertEqual(
+            [item["argv"][:3] for item in result["authenticated_fallbacks"]],
+            [["opencli", "twitter", "article"]],
+        )
+
+    def test_status_404_stays_not_found(self):
+        with mock.patch.object(
+            XURL,
+            "fetch_json",
+            side_effect=XURL.KnownUrlError("not_found", "FxTwitter returned HTTP 404."),
+        ), mock.patch.object(XURL, "fetch_jina", side_effect=XURL.KnownUrlError("not_found", "x")):
+            result = XURL.read_known_url(
+                "https://x.com/someone/status/2032093606551707648",
+                timeout=30,
+                allow_jina_fallback=True,
+            )
+        self.assertEqual(result["errors"][0]["category"], "not_found")
+
+    def test_non_ascii_digit_ids_are_rejected_before_any_request(self):
+        for url in (
+            "https://x.com/a/status/١٢٣",
+            "https://x.com/i/status/１２３",
+            "https://x.com/i/article/١٢٣",
+        ):
+            with self.subTest(url=url):
+                with self.assertRaises(XURL.KnownUrlError) as raised:
+                    XURL.parse_known_url(url)
+                self.assertEqual(raised.exception.category, "unsupported_url")
 
     def test_public_jina_fallback_does_not_use_login_state(self):
         with mock.patch.object(
@@ -444,6 +590,97 @@ class KnownXUrlTests(unittest.TestCase):
                 for item in result["authenticated_fallbacks"]
             )
         )
+
+
+class FakeResponse:
+    def __init__(self, *, body=b"{}", read_error=None):
+        self.body = body
+        self.read_error = read_error
+
+    def read(self, _amount):
+        if self.read_error is not None:
+            raise self.read_error
+        return self.body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        return False
+
+
+class NetworkErrorTests(unittest.TestCase):
+    def test_stalled_local_server_is_a_timeout_not_a_crash(self):
+        # Python 3.9 raises a bare socket.timeout while waiting for headers.
+        server = socket.socket()
+        self.addCleanup(server.close)
+        server.bind(("127.0.0.1", 0))
+        server.listen(1)
+        port = server.getsockname()[1]
+        with mock.patch.object(XURL, "FX_API", f"http://127.0.0.1:{port}/2"):
+            result = XURL.read_known_url(
+                "https://x.com/example/status/2000000000000000001",
+                timeout=1,
+                allow_jina_fallback=False,
+            )
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["errors"][0]["category"], "timeout")
+        self.assertEqual(result["errors"][0]["backend"], "fxtwitter-public")
+
+    def test_fetch_json_classifies_transport_failures(self):
+        cases = (
+            ({"side_effect": socket.timeout("timed out")}, "timeout"),
+            ({"side_effect": urllib.error.URLError(socket.timeout("timed out"))}, "timeout"),
+            ({"side_effect": urllib.error.URLError(ConnectionRefusedError())}, "network_error"),
+            ({"side_effect": http.client.RemoteDisconnected("closed")}, "network_error"),
+            ({"side_effect": http.client.BadStatusLine("junk")}, "network_error"),
+            ({"side_effect": ConnectionResetError()}, "network_error"),
+            (
+                {"return_value": FakeResponse(read_error=socket.timeout("timed out"))},
+                "timeout",
+            ),
+            (
+                {"return_value": FakeResponse(read_error=http.client.IncompleteRead(b"{"))},
+                "network_error",
+            ),
+        )
+        for behavior, category in cases:
+            with self.subTest(behavior=behavior), mock.patch.object(
+                XURL.urllib.request, "urlopen", **behavior
+            ):
+                with self.assertRaises(XURL.KnownUrlError) as raised:
+                    XURL.fetch_json("/status/1", query=None, timeout=5)
+            self.assertEqual(raised.exception.category, category)
+
+    def test_fetch_json_keeps_http_status_categories(self):
+        for code, category in ((404, "not_found"), (429, "rate_limited"), (503, "upstream_http_error")):
+            error = urllib.error.HTTPError("https://api.fxtwitter.com/2", code, "x", {}, None)
+            with self.subTest(code=code), mock.patch.object(
+                XURL.urllib.request, "urlopen", side_effect=error
+            ):
+                with self.assertRaises(XURL.KnownUrlError) as raised:
+                    XURL.fetch_json("/status/1", query=None, timeout=5)
+            self.assertEqual(raised.exception.category, category)
+
+    def test_fetch_jina_classifies_transport_failures(self):
+        cases = (
+            (socket.timeout("timed out"), "timeout"),
+            (http.client.BadStatusLine("junk"), "network_error"),
+            (urllib.error.URLError(ConnectionRefusedError()), "network_error"),
+            (
+                urllib.error.HTTPError("https://r.jina.ai/", 451, "x", {}, None),
+                "jina_unavailable",
+            ),
+        )
+        for error, category in cases:
+            with self.subTest(error=type(error).__name__), mock.patch.object(
+                XURL.urllib.request, "urlopen", side_effect=error
+            ):
+                with self.assertRaises(XURL.KnownUrlError) as raised:
+                    XURL.fetch_jina(
+                        "https://x.com/example/status/2000000000000000001", timeout=5
+                    )
+            self.assertEqual(raised.exception.category, category)
 
 
 if __name__ == "__main__":

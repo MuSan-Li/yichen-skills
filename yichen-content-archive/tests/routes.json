@@ -110,8 +110,8 @@
     "platform": "wechat",
     "action": "read",
     "decision": "route",
-    "route_skill": "wechat-mp-batch-exporter",
-    "allowed_branch": "single-url"
+    "route_backend": "wechat-known-url",
+    "allowed_branch": "known-url-read"
   },
   {
     "case": "known_wechat_url_file_archive",
@@ -119,8 +119,8 @@
     "platform": "wechat",
     "action": "archive",
     "decision": "route",
-    "route_skill": "wechat-mp-batch-exporter",
-    "allowed_branch": "download_urls"
+    "route_backend": "wechat-known-url",
+    "allowed_branch": "known-url-download"
   },
   {
     "case": "known_youtube_info",

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 火山引擎录音文件识别 - 自动化脚本
-用法: python transcribe.py <本地文件路径> [--dry-run] [--no-cache] [--no-execute] [--request-id <id>]
+用法: python volc_asr_transcribe.py <本地文件路径> [--dry-run] [--no-cache] [--no-execute] [--request-id <id>]
 
 需要设置环境变量:
 export TOS_ACCESS_KEY=你的AccessKeyId

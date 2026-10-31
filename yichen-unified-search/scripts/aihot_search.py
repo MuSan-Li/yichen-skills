@@ -9,6 +9,13 @@ import ipaddress
 import json
 import re
 import sys
+from pathlib import Path
+
+# `python3 -I` drops the script directory from sys.path; the sibling modules
+# are part of this Skill, so load them from here rather than from the working directory.
+_SCRIPT_DIR = str(Path(__file__).resolve().parent)
+if _SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPT_DIR)
 
 from public_urls import is_public_http_url
 from datetime import datetime, timedelta, timezone
@@ -40,7 +47,13 @@ AI_SUMMARY_LIMITATION = (
     "AI HOT summaries may be AI-generated discovery text; verify the original URL "
     "before citing facts."
 )
+UNKNOWN_CATEGORY = "unknown"
+UNKNOWN_CATEGORY_LIMITATION = (
+    "AI HOT returned a category outside the known set; it is recorded as unknown."
+)
 MAX_RESPONSE_BYTES = 4_000_000
+PAGE_SIZE = 100  # AI HOT caps `take` at 100 per page
+MAX_PAGES = 20
 
 
 class RejectRedirects(HTTPRedirectHandler):
@@ -184,9 +197,19 @@ def normalize_raw_candidate(
     url = validate_public_http_url(raw.get("url") or raw.get("sourceUrl"))
     title = required_text(raw.get("title"), field="title")
     raw_category = raw.get("category", category)
-    resolved_category = optional_text(raw_category, field="category")
-    if resolved_category is not None and resolved_category not in CATEGORIES:
-        raise ValueError("category is not recognized")
+    category_raw = None
+    if raw_category is None:
+        resolved_category = None
+    elif isinstance(raw_category, str) and raw_category.strip() in CATEGORIES:
+        resolved_category = raw_category.strip()
+    elif isinstance(raw_category, str) and not raw_category.strip():
+        resolved_category = None
+    else:
+        # An unrecognized category is metadata drift, not an unsafe row: keep the
+        # candidate and expose the upstream label for review.
+        resolved_category = UNKNOWN_CATEGORY
+        if isinstance(raw_category, str):
+            category_raw = raw_category.strip()[:100]
     return {
         "id": optional_source_id(raw.get("id")),
         "title": title,
@@ -199,6 +222,7 @@ def normalize_raw_candidate(
         ),
         "published_at": optional_timestamp(raw.get("publishedAt"), field="publishedAt"),
         "category": resolved_category,
+        "category_raw": category_raw,
     }
 
 
@@ -234,6 +258,9 @@ def candidate(
 ) -> dict:
     url = raw["url"]
     resolved_category = raw.get("category") or category
+    limitations = [AI_SUMMARY_LIMITATION]
+    if resolved_category == UNKNOWN_CATEGORY:
+        limitations.append(UNKNOWN_CATEGORY_LIMITATION)
     return {
         "candidate_id": stable_id(raw.get("id"), url),
         "query": query,
@@ -270,11 +297,12 @@ def candidate(
             "aihot": {
                 "source_name": raw.get("source"),
                 "category": resolved_category,
+                "category_raw": raw.get("category_raw"),
                 "title_en": raw.get("title_en"),
                 "daily_date": daily_date,
             }
         },
-        "limitations": [AI_SUMMARY_LIMITATION],
+        "limitations": limitations,
     }
 
 
@@ -286,7 +314,9 @@ def normalize_items(
     days: int,
     feed: str,
     retrieved_at: str,
+    since: datetime | None = None,
 ) -> dict:
+    """Normalize items; ``since`` re-checks the requested window locally."""
     raw_items = payload.get("items")
     if not isinstance(raw_items, list):
         raise ValueError("AI HOT items response is missing an items list")
@@ -300,12 +330,23 @@ def normalize_items(
     rejected_count = 0
     duplicate_count = 0
     accepted_count = 0
+    outside_window_count = 0
+    time_unverified_count = 0
+    unknown_category_count = 0
     for raw in raw_items:
         try:
             normalized = normalize_raw_candidate(raw)
         except ValueError:
             rejected_count += 1
             continue
+        if since is not None:
+            published_at = normalized.get("published_at")
+            if published_at is None:
+                time_unverified_count += 1
+            elif datetime.fromisoformat(published_at.replace("Z", "+00:00")) < since:
+                # The server is asked for `since`; do not trust it blindly.
+                outside_window_count += 1
+                continue
         candidate_id = stable_id(normalized.get("id"), normalized["url"])
         if candidate_id in seen_ids or normalized["url"] in seen_urls:
             duplicate_count += 1
@@ -313,6 +354,8 @@ def normalize_items(
         seen_ids.add(candidate_id)
         seen_urls.add(normalized["url"])
         accepted_count += 1
+        if normalized.get("category") == UNKNOWN_CATEGORY:
+            unknown_category_count += 1
         if len(candidates) >= limit:
             continue
         candidates.append(
@@ -323,7 +366,22 @@ def normalize_items(
                 retrieved_at=retrieved_at,
             )
         )
-    return envelope(
+    limitations = [
+        "AI HOT is a curated discovery index, not an exhaustive web index.",
+        AI_SUMMARY_LIMITATION,
+        "The AI HOT items endpoint covers at most the latest 7 days.",
+    ]
+    if outside_window_count:
+        limitations.append(
+            f"{outside_window_count} returned item(s) were published before the requested "
+            "since time and were dropped by the local window check."
+        )
+    if time_unverified_count:
+        limitations.append(
+            f"{time_unverified_count} returned item(s) have no publishedAt; they were kept "
+            "on the server-side since filter without local time verification."
+        )
+    result = envelope(
         query=query,
         requested_limit=limit,
         time_range={"days": days},
@@ -333,12 +391,16 @@ def normalize_items(
         rejected_count=rejected_count,
         duplicate_count=duplicate_count,
         truncated=has_next or accepted_count > limit,
-        limitations=[
-            "AI HOT is a curated discovery index, not an exhaustive web index.",
-            AI_SUMMARY_LIMITATION,
-            "The AI HOT items endpoint covers at most the latest 7 days.",
-        ],
+        limitations=limitations,
+        unknown_category_count=unknown_category_count,
     )
+    if since is not None:
+        result["request"]["time_range"]["since"] = iso_z(since)
+        result["coverage"][0].update(
+            outside_window_count=outside_window_count,
+            time_unverified_count=time_unverified_count,
+        )
+    return result
 
 
 def normalize_daily(
@@ -384,6 +446,7 @@ def normalize_daily(
     rejected_count = structural_rejected_count
     duplicate_count = 0
     accepted_count = 0
+    unknown_category_count = 0
     for raw, category in raw_candidates:
         try:
             normalized = normalize_raw_candidate(raw, category=category)
@@ -397,6 +460,8 @@ def normalize_daily(
         seen_ids.add(candidate_id)
         seen_urls.add(normalized["url"])
         accepted_count += 1
+        if normalized.get("category") == UNKNOWN_CATEGORY:
+            unknown_category_count += 1
         if len(candidates) >= limit:
             continue
         candidates.append(
@@ -429,6 +494,7 @@ def normalize_daily(
             "AI HOT daily reports are fixed UTC-day editorial snapshots, not rolling 24-hour windows.",
             AI_SUMMARY_LIMITATION,
         ],
+        unknown_category_count=unknown_category_count,
     )
 
 
@@ -444,8 +510,14 @@ def envelope(
     duplicate_count: int,
     truncated: bool,
     limitations: list[str],
+    unknown_category_count: int = 0,
 ) -> dict:
     limitations = list(limitations)
+    if unknown_category_count:
+        limitations.append(
+            f"{unknown_category_count} accepted item(s) had an unrecognized category and "
+            "were kept with category=unknown."
+        )
     errors: list[dict[str, str]] = []
     status = "completed"
     if rejected_count:
@@ -487,6 +559,7 @@ def envelope(
                 "returned_count": len(candidates),
                 "rejected_count": rejected_count,
                 "duplicate_count": duplicate_count,
+                "unknown_category_count": unknown_category_count,
                 "truncated": truncated,
                 "login_state_used": False,
                 "limitations": limitations,
@@ -530,20 +603,47 @@ def build_url(
     category: str | None,
     date: str | None,
     now: datetime,
+    cursor: str | None = None,
 ) -> str:
     if feed == "daily":
         suffix = f"/{date}" if date else ""
         return f"{BASE_URL}/api/public/daily{suffix}"
     params = {
         "mode": feed,
-        "take": str(limit),
+        "take": str(min(limit, PAGE_SIZE)),
         "since": iso_z(now - timedelta(days=days)),
     }
     if keyword:
         params["q"] = keyword
     if category:
         params["category"] = category
+    if cursor:
+        # nextCursor is opaque: pass it back verbatim, never parse or derive it.
+        params["cursor"] = cursor
     return f"{BASE_URL}/api/public/items?{urlencode(params)}"
+
+
+def fetch_item_pages(first_url: str, next_url, fetch, timeout: int, max_pages: int) -> dict:
+    """Follow nextCursor serially until hasNext is false or max_pages is reached."""
+    items: list = []
+    payload = fetch(first_url, timeout)
+    pages = 1
+    while True:
+        page_items = payload.get("items")
+        if not isinstance(page_items, list):
+            raise ValueError("AI HOT items response is missing an items list")
+        items.extend(page_items)
+        has_next = payload.get("hasNext", False)
+        cursor = payload.get("nextCursor")
+        if not isinstance(has_next, bool):
+            raise ValueError("AI HOT items response has an invalid hasNext value")
+        if not has_next or not cursor or pages >= max_pages:
+            break
+        if not isinstance(cursor, str):
+            raise ValueError("AI HOT items response has an invalid nextCursor value")
+        payload = fetch(next_url(cursor), timeout)
+        pages += 1
+    return {"items": items, "hasNext": bool(has_next and cursor), "pages_fetched": pages}
 
 
 def fetch_json(url: str, timeout: int, *, opener=None) -> dict:
@@ -579,9 +679,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--category", choices=CATEGORIES)
     parser.add_argument("--date", help="YYYY-MM-DD; only valid with --feed daily")
     parser.add_argument("--timeout", type=int, default=20)
+    parser.add_argument(
+        "--max-pages", type=int, default=1,
+        help=f"Follow nextCursor serially up to this many pages (1-{MAX_PAGES}); items feeds only",
+    )
     args = parser.parse_args()
-    if not 1 <= args.limit <= 100:
-        parser.error("--limit must be between 1 and 100")
+    if not 1 <= args.max_pages <= MAX_PAGES:
+        parser.error(f"--max-pages must be between 1 and {MAX_PAGES}")
+    if args.max_pages > 1 and args.feed == "daily":
+        parser.error("--max-pages only applies to the selected and all feeds")
+    max_limit = PAGE_SIZE * args.max_pages
+    if not 1 <= args.limit <= max_limit:
+        parser.error(f"--limit must be between 1 and {max_limit}")
     if not 1 <= args.days <= 7:
         parser.error("--days must be between 1 and 7")
     if not 1 <= args.timeout <= 60:
@@ -608,10 +717,22 @@ def run_items(args: argparse.Namespace, now: datetime, fetch=None) -> dict:
     for topic in args.keyword or [None]:
         url = build_url(feed=args.feed, days=args.days, limit=args.limit,
                         keyword=topic, category=args.category, date=None, now=now)
+        max_pages = getattr(args, "max_pages", 1)
+
+        def next_url(cursor, topic=topic):
+            return build_url(feed=args.feed, days=args.days, limit=args.limit, keyword=topic,
+                             category=args.category, date=None, now=now, cursor=cursor)
+
         try:
-            payload = fetch(url, args.timeout)
+            if max_pages > 1:
+                payload = fetch_item_pages(url, next_url, fetch, args.timeout, max_pages)
+            else:
+                payload = fetch(url, args.timeout)
             result = normalize_items(payload, query=args.query, limit=args.limit, days=args.days,
-                                     feed=args.feed, retrieved_at=iso_z(utc_now()))
+                                     feed=args.feed, retrieved_at=iso_z(utc_now()),
+                                     since=(now - timedelta(days=args.days)).replace(microsecond=0))
+            if "pages_fetched" in payload:
+                result["coverage"][0]["pages_fetched"] = payload["pages_fetched"]
         except HTTPError as exc:
             result = error_envelope(args.query, "http_error", f"AI HOT returned HTTP {exc.code}")
         except (URLError, TimeoutError, OSError):

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import unittest
 from pathlib import Path
 
@@ -26,7 +27,13 @@ class RouterContractTests(unittest.TestCase):
         self.assertFalse((ROOT / retired_name).exists())
         source = (ROOT / "yichen-web-research/SKILL.md").read_text(encoding="utf-8")
         self.assertIn("唯一的互联网研究总入口", source)
-        self.assertIn("Use when an internet-research request", source)
+        # The 2026-09-05 rule migration replaced the English trigger with a Chinese
+        # description; check that it still scopes multi-stage research and excludes
+        # single-stage work instead of pinning the retired English wording.
+        description = re.search(r"(?m)^description:\s*(.+)$", source.split("---", 2)[1])
+        self.assertIsNotNone(description)
+        for marker in ("多阶段互联网研究", "横纵研究", "单次搜索", "已知链接读取"):
+            self.assertIn(marker, description.group(1))
 
     def test_download_executors_have_single_source(self) -> None:
         archive_scripts = ROOT / "yichen-content-archive/scripts"
@@ -68,12 +75,40 @@ class RouterContractTests(unittest.TestCase):
         self.assertIn("不下载媒体、不归档", search)
         self.assertIn("不得执行关键词搜索", archive)
 
-    def test_x_search_and_known_url_have_separate_children(self) -> None:
-        router = (ROOT / "yichen-web-research/SKILL.md").read_text(
+    def test_x_search_uses_grok_primary_and_quota_only_fxtwitter(self) -> None:
+        search = (ROOT / "yichen-unified-search/SKILL.md").read_text(
             encoding="utf-8"
         )
-        self.assertIn("Grok CLI 原生 `x_search` 优先", router)
-        self.assertIn("匿名 FxTwitter → Jina 优先", router)
+        routes = (
+            ROOT / "yichen-unified-search/references/routes.md"
+        ).read_text(encoding="utf-8")
+        adapter = ROOT / "yichen-unified-search/scripts/fxtwitter_search.py"
+        self.assertTrue(adapter.is_file())
+        # Same contract as before, in unified-search's current wording: Grok CLI first,
+        # FxTwitter only after explicit quota exhaustion, every other failure stops.
+        self.assertIn("X 一律先官方 Grok CLI", search)
+        self.assertIn("只有明确额度耗尽才能转 FxTwitter", search)
+        self.assertIn("超时、网络、服务错误和主链零结果都不能当成额度耗尽", search)
+        self.assertIn("Grok CLI 原生 `x_search`", routes)
+        self.assertIn("只有明确账号额度或使用上限耗尽时", routes)
+        self.assertIn("必须停止并报告，禁止静默调用 FxTwitter", routes)
+        self.assertIn("不携带 Cookie、Token 或 X 登录态", routes)
+
+    def test_known_x_url_routes_to_content_archive_anonymously(self) -> None:
+        archive = (ROOT / "yichen-content-archive/SKILL.md").read_text(
+            encoding="utf-8"
+        )
+        routes = (
+            ROOT / "yichen-content-archive/references/platform-routes.md"
+        ).read_text(encoding="utf-8")
+        adapter = ROOT / "yichen-content-archive/scripts/x_known_url.py"
+        self.assertTrue(adapter.is_file())
+        self.assertIn("FxTwitter → Jina 匿名公共读取", archive)
+        self.assertIn("exact-article-parent", (
+            ROOT / "yichen-content-archive/tests/routes.json"
+        ).read_text(encoding="utf-8"))
+        self.assertIn("Article ID", routes)
+        self.assertIn("当轮授权", routes)
 
     def test_asr_uses_unified_child_route(self) -> None:
         router = (ROOT / "yichen-web-research/SKILL.md").read_text(
@@ -120,6 +155,11 @@ class RouterContractTests(unittest.TestCase):
     def test_hengzong_research_is_offline_evidence_protocol(self) -> None:
         root = ROOT / "yichen-web-research"
         source = (root / "SKILL.md").read_text(encoding="utf-8")
+        # The 2026-09-05 rule migration moved the mode's execution steps verbatim
+        # from SKILL.md into this contract; SKILL.md links to it on entry.
+        contract = (root / "references/hengzong-execution-contract.md").read_text(
+            encoding="utf-8"
+        )
         reference = (root / "references/hengzong-research.md").read_text(
             encoding="utf-8"
         )
@@ -131,9 +171,10 @@ class RouterContractTests(unittest.TestCase):
         )
 
         self.assertIn("横纵研究模式", source)
-        self.assertIn("past_event -> present_effect -> implication", source)
-        self.assertIn("固定 1–3 万字不是完成标准", source)
-        self.assertIn("搜索完成本身绝不转移归档授权", source)
+        self.assertIn("references/hengzong-execution-contract.md", source)
+        self.assertIn("past_event -> present_effect -> implication", contract)
+        self.assertIn("固定 1–3 万字不是完成标准", contract)
+        self.assertIn("搜索完成本身绝不转移归档授权", contract)
         self.assertIn("claim-source ledger", reference)
         self.assertIn("event_date", reference)
         self.assertIn("published_at", reference)
@@ -218,24 +259,29 @@ class RouterContractTests(unittest.TestCase):
         source = (ROOT / "yichen-web-research/SKILL.md").read_text(
             encoding="utf-8"
         )
-        doctor = (
-            ROOT / "yichen-web-research/scripts/doctor_yichen.py"
+        # Backend selection belongs to the children; the router keeps only the
+        # cross-stage site gate, and the doctor reference keeps the backend note.
+        readiness = (
+            ROOT / "yichen-web-research/references/backend-readiness.md"
         ).read_text(encoding="utf-8")
-        self.assertIn("不进入默认搜索链", source)
-        self.assertIn("最多 100 条", source)
-        self.assertIn("只保留同源", source)
-        self.assertIn("不声明支持 Crawl", source)
+        doctor = (ROOT / "yichen-web-research/scripts/doctor_yichen.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("不进入默认搜索链", readiness)
+        self.assertIn("路径、页数和深度", source)
         self.assertIn("network_probe_performed", doctor)
         self.assertIn("FIRECRAWL_KEY_FILE.lstat()", doctor)
         self.assertNotIn("api.firecrawl.dev", doctor)
 
     def test_zhihu_is_explicit_public_backend_with_offline_doctor(self) -> None:
-        source = (ROOT / "yichen-web-research/SKILL.md").read_text(
+        # The Zhihu route boundary is documented next to the doctor check that
+        # enforces it, not repeated in the router SKILL.md.
+        source = (
+            ROOT / "yichen-web-research/references/backend-readiness.md"
+        ).read_text(encoding="utf-8")
+        doctor = (ROOT / "yichen-web-research/scripts/doctor_yichen.py").read_text(
             encoding="utf-8"
         )
-        doctor = (
-            ROOT / "yichen-web-research/scripts/doctor_yichen.py"
-        ).read_text(encoding="utf-8")
         adapter = ROOT / "yichen-unified-search/scripts/zhihu_adapter.py"
 
         self.assertTrue(adapter.is_file())
@@ -260,10 +306,14 @@ class RouterContractTests(unittest.TestCase):
         doctor = (
             ROOT / "yichen-web-research/scripts/doctor_yichen.py"
         ).read_text(encoding="utf-8")
-        self.assertIn("小红书最多 20 条", source)
-        self.assertIn("抖音最多 30 条", source)
-        self.assertIn("请求间隔不少于 5 秒", source)
-        self.assertIn("私域读取必须停下", source)
+        # Limits live in unified-search; the router keeps only the cross-stage gates.
+        search = (ROOT / "yichen-unified-search/SKILL.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("单次分别最多 20/30 条", search)
+        self.assertIn("间隔至少 5 秒", search)
+        self.assertIn("所有社交平台保持只读", source)
+        self.assertIn("分别按目标 Skill 的授权门执行", source)
         self.assertIn('"current_turn_authorization_required": False', doctor)
         self.assertIn(
             '"write_or_private_scope_authorization_required": True',

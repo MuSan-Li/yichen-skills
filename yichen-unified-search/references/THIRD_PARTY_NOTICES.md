@@ -19,3 +19,7 @@ Permission is hereby granted, free of charge, to any person obtaining a copy of 
 The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
 
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+## AI HOT Skill output format
+
+`references/aihot-output-format.md` is copied from `references/output-format.md` of the `aihot` Skill published by AI HOT (aihot.virxact.com) and included in [KKKKhazix/khazix-skills](https://github.com/KKKKhazix/khazix-skills/tree/main/aihot) under the MIT License, Copyright (c) 2026 数字生命卡兹克. The complete license text is kept in the repository's `licenses/KKKKhazix-khazix-skills-LICENSE.txt`. Only a source note was added; `scripts/aihot_search.py` is an independent implementation of the public AI HOT API calls and does not include upstream code.

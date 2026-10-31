@@ -23,7 +23,8 @@ python3 scripts/compare_installed_skills.py --local-root "$HOME/.agents/skills"
 ## 有意保留的不同发布链
 
 - X 文章草稿上传器：公开版本与独立私有 Ailu 集成有不同运行时和信任契约。私有版本号较大不代表可整包公开；不复制私有仓库绑定、签名/来源清单、运行时包或授权数据。公开版只承诺自己的 README 能力。
-- ASR：公开执行器通过环境变量注入配置，本机可以有目录外执行器和钥匙串适配。检查调用目标后比较，不以 Skill 目录缺文件判定未安装；不迁移个人应用标识、Token 或计费配置。
+- ASR：公开执行器通过环境变量注入配置，本机可以有目录外执行器和钥匙串适配。`yichen-asr` 公开版只随附环境变量配置的豆包执行器 `scripts/backends/volc_asr_transcribe.py`；本机同名文件可以是私有副本，Step 执行器由用户经 `YICHEN_STEP_ASR_SCRIPT`、`YICHEN_STEP_ASR_TIMESTAMPS_SCRIPT` 自行提供，比较结果中该文件为 changed 属预期。检查调用目标后比较，不以 Skill 目录缺文件判定未安装；不迁移个人应用标识、Token 或计费配置。
+- 统一搜索：本机安装版可以带有尚未公开的后端适配器或 OpenCLI 覆盖层。只把明确授权发布的增量合并进公开版，不因安装版文件更多就整目录覆盖。
 - 企微官方 CLI：公开版的可配置 helper 与本机私有 helper 可以不同，不把本机路径写入公开代码。
 - Grok：插件 MCP、授权策略文件与 Skill 入口一起核对；个人 .mcp.json 代理与登录态配置不覆盖。
 - 系统和插件缓存由各自安装机制管理。没有本机独立入口的公开 Skill 不自动安装或删除。

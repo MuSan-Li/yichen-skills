@@ -126,6 +126,9 @@ This repository references and adapts ideas/workflows from external projects.
 - What is included:
   - The protocol and implementation in this repository have been adapted for this Skill family and are not represented as an official upstream release.
   - The upstream copyright and complete MIT license text are preserved in the local license copy above.
+- Additional component (`aihot`):
+  - `yichen-unified-search/references/aihot-output-format.md` is copied from the upstream `aihot` Skill's `references/output-format.md` (also distributed by AI HOT, aihot.virxact.com) with only a source note added; it is redistributed under the same MIT License.
+  - `yichen-unified-search/scripts/aihot_search.py` independently implements the public AI HOT API calls and includes no upstream code.
 
 ## 11) joeseesun/yt-search-download
 
@@ -164,6 +167,8 @@ This repository references and adapts ideas/workflows from external projects.
 - `yichen-grok-consult` references the public isolation pattern from `sudoHG/codex-grok-search`, but includes an independently implemented MCP server and deterministic verification layer.
 - `yichen-bookmarks-export` calls Field Theory as an optional external runtime; Field Theory remains under its upstream MIT License, while this repository's independently implemented adapter remains under this repository's license.
 - The horizontal-and-vertical research mode in `yichen-web-research` is based on, inspired by, and extends KKKKhazix/khazix-skills `hv-analysis`; the upstream author, pinned commit, and MIT license are preserved above.
+- The AI HOT Chinese briefing format in `yichen-unified-search` is copied from the `aihot` Skill in KKKKhazix/khazix-skills; the MIT license is preserved above.
+- `yichen-content-archive/scripts/wechat_known_url.py` reads public WeChat article pages directly. Its explicit, off-by-default `--relay-fallback` targets the public down.mptext.top endpoint associated with `wechat-article-exporter`, which its operator shut down on 2026-10-31; no upstream code is included.
 - The YouTube search/filter implementation in `yichen-unified-search` is derived in part from `joeseesun/yt-search-download`; Joe Sun's copyright and the complete MIT license text are preserved above and in the local license copy.
 - The Zhihu CLI-compatible runtime is an external dependency and is not redistributed by this repository; users must verify its provenance, license, and service terms separately.
 - `yichen-mac-wechat-dual-open` references public X/Twitter discussion and implements the copy + bundle-id + ad-hoc signing workflow locally.

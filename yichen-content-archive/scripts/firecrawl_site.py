@@ -12,6 +12,7 @@ import argparse
 import base64
 import hashlib
 import hmac
+import http.client
 import ipaddress
 import json
 import os
@@ -22,7 +23,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -52,8 +53,31 @@ MAX_JSON_BYTES = 64 * 1024 * 1024
 MAX_PREFLIGHT_BYTES = 2 * 1024 * 1024
 MAX_MARKDOWN_BYTES = 5 * 1024 * 1024
 MAX_PATH_DECODE_ROUNDS = 12
+MAX_PAGINATION_PAGES = 20
+PREFLIGHT_CONSUMED_NAME = "preflight.consumed.json"
+UNRESERVED_PATH_CHARACTERS = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~/"
+)
 DEFAULT_OUTPUT_ROOT = Path.home() / "Documents" / "content-archive" / "firecrawl-sites"
 SIGNING_CONTEXT = b"yichen-content-archive/firecrawl-preflight/v1"
+# Map can return feeds, robots/sitemap files and static assets; these are not
+# pages to archive. Matched on the last path segment's extension only.
+NON_PAGE_FILENAMES = frozenset({"sitemap.xml", "robots.txt", "sitemap_index.xml"})
+NON_PAGE_EXTENSIONS = frozenset(
+    {
+        "xml", "txt", "pdf", "json", "rss", "atom", "csv",
+        "jpg", "jpeg", "png", "gif", "webp", "svg", "ico", "bmp", "avif", "tif", "tiff",
+        "css", "js", "mjs", "map", "wasm",
+        "woff", "woff2", "ttf", "otf", "eot",
+        "zip", "gz", "tgz", "bz2", "xz", "7z", "rar", "tar", "dmg", "exe", "whl",
+        "mp4", "webm", "mov", "m4v", "mp3", "m4a", "wav", "ogg", "flac",
+    }
+)
+DEPTH_SEMANTICS_NOTE = (
+    "Map does not filter by max_depth; Crawl applies it as Firecrawl maxDiscoveryDepth "
+    "(link-discovery hops from site_url), which cannot be reproduced locally. Signed URLs "
+    "that Crawl does not return are recorded as failed (not_returned_by_crawl), never dropped."
+)
 SPECIAL_USE_DNS_SUFFIXES = (
     "localhost",
     "local",
@@ -367,7 +391,9 @@ def _policy_path(raw: str, label: str) -> str:
         raise SiteError("invalid_scope", f"{label} must be an absolute URL path.")
     decoded = _decode_policy_path(value, label)
     segments = decoded.split("/")
-    if any(segment in {".", ".."} for segment in segments):
+    # Servlet-style routers drop ";params" before resolving dot segments, so
+    # "..;" or ".;jsessionid=1" must be treated exactly like ".." or ".".
+    if any(segment.split(";", 1)[0] in {".", ".."} for segment in segments):
         raise SiteError("invalid_scope", f"{label} contains dot segments.")
     normalized = "/" + "/".join(segment for segment in segments if segment)
     if normalized != "/":
@@ -453,11 +479,36 @@ def normalize_scoped_url(value: Any, scope: Scope) -> str:
     return f"{origin}{encoded_path}"
 
 
+def _path_prefix_pattern(prefix: str) -> str:
+    """Match the decoded prefix and its percent-encoded form in either hex case.
+
+    path_prefix is stored decoded while site_url is sent percent-encoded, so a
+    crawler that tests includePaths against the encoded pathname must match too.
+    Every alternative still percent-decodes to exactly the approved prefix.
+    """
+
+    parts = []
+    for character in prefix:
+        if character in UNRESERVED_PATH_CHARACTERS:
+            parts.append(re.escape(character))
+            continue
+        encoded = "".join(
+            "%" + "".join(
+                f"[{digit}{digit.lower()}]" if digit.isalpha() else digit
+                for digit in f"{byte:02X}"
+            )
+            for byte in character.encode("utf-8")
+        )
+        raw = re.escape(character) if character in "\\]^-[" else f"[{character}]"
+        parts.append(f"(?:{raw}|{encoded})")
+    return "".join(parts)
+
+
 def _fixed_policy(scope: Scope) -> dict[str, Any]:
     prefix_pattern = (
         r"^/.*$"
         if scope.path_prefix == "/"
-        else "^" + re.escape(scope.path_prefix) + r"(?:/.*)?$"
+        else "^" + _path_prefix_pattern(scope.path_prefix) + r"(?:/.*)?$"
     )
     return {
         "api_base": API_BASE,
@@ -573,7 +624,9 @@ class FirecrawlClient:
                     "Firecrawl API attempted to redirect the authenticated request.",
                 ) from None
             raise SiteError("firecrawl_http_error", f"Firecrawl API returned HTTP {exc.code}.") from None
-        except (urllib.error.URLError, TimeoutError, OSError):
+        except (OSError, http.client.HTTPException):
+            # URLError and Python 3.9 socket.timeout are OSError subclasses; a bad
+            # status line or truncated body raises http.client.HTTPException.
             raise SiteError("firecrawl_unavailable", "Firecrawl API could not be reached.") from None
         if len(raw) > MAX_JSON_BYTES:
             raise SiteError("firecrawl_response_too_large", "Firecrawl response exceeded the safe size limit.")
@@ -597,6 +650,11 @@ class FirecrawlClient:
         if not re.fullmatch(r"[A-Za-z0-9_-]{1,200}", job_id):
             raise SiteError("firecrawl_invalid_response", "Firecrawl returned an invalid crawl job ID.")
         return self._request("GET", API_BASE + "/crawl/" + job_id)
+
+    def cancel_crawl(self, job_id: str) -> dict[str, Any]:
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,200}", job_id):
+            raise SiteError("firecrawl_invalid_response", "Firecrawl returned an invalid crawl job ID.")
+        return self._request("DELETE", API_BASE + "/crawl/" + job_id)
 
     def next_page(self, url: str) -> dict[str, Any]:
         _validate_api_url(url)
@@ -658,6 +716,15 @@ def _extract_map_links(response: dict[str, Any]) -> list[Any]:
     return links
 
 
+def _is_non_page_resource(url: str) -> bool:
+    """Conservatively spot Map results that are files, not pages, by extension only."""
+    segment = unquote(urlsplit(url).path).rsplit("/", 1)[-1].lower()
+    if segment in NON_PAGE_FILENAMES:
+        return True
+    stem, dot, extension = segment.rpartition(".")
+    return bool(dot and stem and extension in NON_PAGE_EXTENSIONS)
+
+
 def _filter_map(response: dict[str, Any], scope: Scope) -> tuple[list[str], list[dict[str, Any]], int]:
     raw_links = _extract_map_links(response)
     accepted: list[str] = []
@@ -669,6 +736,10 @@ def _filter_map(response: dict[str, Any], scope: Scope) -> tuple[list[str], list
             normalized = normalize_scoped_url(value, scope)
         except SiteError as exc:
             rejected.append({"item_ref": f"map:{index}", "reason": exc.category})
+            continue
+        if _is_non_page_resource(normalized):
+            # sitemap.xml, robots.txt, images, scripts...: never signed for Crawl.
+            rejected.append({"item_ref": f"map:{index}", "reason": "non_page_resource"})
             continue
         if normalized in seen:
             rejected.append({"item_ref": f"map:{index}", "reason": "duplicate"})
@@ -763,6 +834,7 @@ def _write_map_failure(
         },
         "cap_reached": cap_reached,
         "completeness": "unknown",
+        "depth_semantics_note": DEPTH_SEMANTICS_NOTE,
         "failure": {"category": error.category},
         "failures": failures,
         "policy": _fixed_policy(scope),
@@ -932,6 +1004,7 @@ def run_preflight(
         },
         "cap_reached": map_audit["cap_reached"],
         "completeness": map_audit["completeness"],
+        "depth_semantics_note": DEPTH_SEMANTICS_NOTE,
         "policy": _fixed_policy(scope),
         "quota_exposure": _quota_exposure(scope),
         "artifacts": {
@@ -1043,6 +1116,59 @@ def _load_verified_preflight(
     return preflight, preflight_bytes, map_bytes, list_bytes, urls
 
 
+@dataclass
+class CrawlOutcome:
+    job_id: str | None = None
+    documents: list[Any] = field(default_factory=list)
+    # A job-level failure: no returned page is trusted.
+    error: SiteError | None = None
+    # Pagination stopped early: pages already returned are still archived.
+    partial_error: SiteError | None = None
+    cancel: dict[str, Any] | None = None
+
+
+def _cancel_crawl(client: Any, job_id: str) -> dict[str, Any]:
+    """Best-effort cancel of an abandoned remote job so it stops consuming pages."""
+
+    try:
+        response = client.cancel_crawl(job_id)
+    except SiteError as exc:
+        return {"attempted": True, "status": "failed", "category": exc.category}
+    state = str(response.get("status", "")).lower() if isinstance(response, dict) else ""
+    return {
+        "attempted": True,
+        "status": "cancelled" if state == "cancelled" else "requested",
+    }
+
+
+def _paginate(
+    client: Any, status: dict[str, Any], documents: list[Any], maximum_documents: int
+) -> SiteError | None:
+    next_url = status.get("next")
+    visited: set[str] = set()
+    while (
+        len(documents) < maximum_documents
+        and isinstance(next_url, str)
+        and next_url
+        and next_url not in visited
+    ):
+        if len(visited) >= MAX_PAGINATION_PAGES:
+            return SiteError("firecrawl_invalid_response", "Crawl pagination exceeded the safe bound.")
+        visited.add(next_url)
+        try:
+            page = client.next_page(next_url)
+        except SiteError as exc:
+            return exc
+        extra = page.get("data", []) if isinstance(page, dict) else None
+        if not isinstance(extra, list):
+            return SiteError("firecrawl_invalid_response", "Crawl pagination data is invalid.")
+        if len(documents) + len(extra) > maximum_documents:
+            return SiteError("firecrawl_invalid_response", "Crawl pagination exceeded the signed limit.")
+        documents.extend(extra)
+        next_url = page.get("next")
+    return None
+
+
 def _collect_crawl(
     client: Any,
     payload: dict[str, Any],
@@ -1050,67 +1176,99 @@ def _collect_crawl(
     timeout: int,
     poll_seconds: float,
     sleep: Callable[[float], None] = time.sleep,
-) -> tuple[str, list[Any]]:
-    started = client.start_crawl(payload)
+    clock: Callable[[], float] = time.monotonic,
+) -> CrawlOutcome:
+    outcome = CrawlOutcome()
+    try:
+        started = client.start_crawl(payload)
+    except SiteError as exc:
+        outcome.error = exc
+        return outcome
     job_id = started.get("id") if isinstance(started, dict) else None
     if not isinstance(job_id, str) or not job_id:
-        raise SiteError("firecrawl_invalid_response", "Firecrawl did not return a crawl job ID.")
-    deadline = time.monotonic() + timeout
+        outcome.error = SiteError("firecrawl_invalid_response", "Firecrawl did not return a crawl job ID.")
+        return outcome
+    outcome.job_id = job_id
+    deadline = clock() + timeout
     while True:
-        status = client.crawl_status(job_id)
+        try:
+            status = client.crawl_status(job_id)
+        except SiteError as exc:
+            outcome.error = exc
+            outcome.cancel = _cancel_crawl(client, job_id)
+            return outcome
         state = str(status.get("status", "")).lower()
         if state == "completed":
             documents = status.get("data", [])
-            if not isinstance(documents, list):
-                raise SiteError("firecrawl_invalid_response", "Completed Crawl data is not a list.")
             maximum_documents = int(payload["limit"])
-            if len(documents) > maximum_documents:
-                raise SiteError("firecrawl_invalid_response", "Crawl returned more documents than the signed limit.")
-            next_url = status.get("next")
-            visited: set[str] = set()
-            while (
-                len(documents) < maximum_documents
-                and isinstance(next_url, str)
-                and next_url
-                and next_url not in visited
-            ):
-                visited.add(next_url)
-                page = client.next_page(next_url)
-                extra = page.get("data", [])
-                if not isinstance(extra, list):
-                    raise SiteError("firecrawl_invalid_response", "Crawl pagination data is invalid.")
-                documents.extend(extra)
-                if len(documents) > maximum_documents:
-                    raise SiteError("firecrawl_invalid_response", "Crawl pagination exceeded the signed limit.")
-                next_url = page.get("next")
-                if len(visited) >= 20:
-                    raise SiteError("firecrawl_invalid_response", "Crawl pagination exceeded the safe bound.")
-            return job_id, documents
+            if not isinstance(documents, list):
+                outcome.error = SiteError("firecrawl_invalid_response", "Completed Crawl data is not a list.")
+            elif len(documents) > maximum_documents:
+                outcome.error = SiteError(
+                    "firecrawl_invalid_response", "Crawl returned more documents than the signed limit."
+                )
+            else:
+                outcome.documents = list(documents)
+                outcome.partial_error = _paginate(
+                    client, status, outcome.documents, maximum_documents
+                )
+            return outcome
         if state in {"failed", "cancelled"}:
-            raise SiteError("firecrawl_crawl_failed", "Firecrawl Crawl did not complete.")
-        if time.monotonic() >= deadline:
-            raise SiteError("firecrawl_timeout", "Firecrawl Crawl did not finish before the timeout.")
+            outcome.error = SiteError("firecrawl_crawl_failed", "Firecrawl Crawl did not complete.")
+            return outcome
+        if clock() >= deadline:
+            outcome.error = SiteError("firecrawl_timeout", "Firecrawl Crawl did not finish before the timeout.")
+            outcome.cancel = _cancel_crawl(client, job_id)
+            return outcome
         sleep(poll_seconds)
 
 
-def _document_url(item: Any) -> Any:
+def _document_urls(item: Any) -> tuple[Any, Any]:
+    """Return the requested sourceURL and the final URL, or None if not reported."""
+
     if not isinstance(item, dict):
-        return None
+        return None, None
     metadata = item.get("metadata")
+    final = None
     if isinstance(metadata, dict):
+        final = metadata.get("url") or None
         for key in ("sourceURL", "sourceUrl", "url"):
             if metadata.get(key):
-                return metadata[key]
-    return item.get("url")
+                return metadata[key], final
+    return item.get("url"), final
 
 
-def _safe_metadata(item: dict[str, Any], url: str) -> dict[str, Any]:
+def _document_status_code(item: Any) -> tuple[bool, int | None]:
+    """Return whether statusCode was reported and its integer value when valid."""
+
+    metadata = item.get("metadata") if isinstance(item, dict) else None
+    value = metadata.get("statusCode") if isinstance(metadata, dict) else None
+    if value is None:
+        return False, None
+    if isinstance(value, int) and not isinstance(value, bool):
+        return True, value
+    if isinstance(value, str) and re.fullmatch(r"[1-5][0-9]{2}", value.strip()):
+        return True, int(value.strip())
+    return True, None
+
+
+def _safe_metadata(
+    item: dict[str, Any],
+    url: str,
+    *,
+    final_url: str | None,
+    status_code_reported: bool,
+) -> dict[str, Any]:
     source = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
     result: dict[str, Any] = {"source_url": url}
     for key in ("title", "description", "language", "statusCode"):
         value = source.get(key)
         if isinstance(value, (str, int)) and not isinstance(value, bool):
             result[key] = value
+    # Missing fields are archived under sourceURL but never claimed as verified.
+    result["final_url"] = final_url
+    result["final_url_reported"] = final_url is not None
+    result["status_code_reported"] = status_code_reported
     return result
 
 
@@ -1124,6 +1282,8 @@ def _write_execute_result(
     crawl_error: SiteError | None,
     now: datetime,
     preflight_audit: dict[str, Any],
+    partial_error: SiteError | None = None,
+    crawl_cancel: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     web_root = run_dir / "web"
     web_root.mkdir(mode=0o700)
@@ -1131,9 +1291,11 @@ def _write_execute_result(
     accepted: dict[str, list[str]] = {}
     rejected_by_url: dict[str, str] = {}
     rejected_documents: list[dict[str, Any]] = []
+    document_checks = {"final_url_missing": 0, "status_code_missing": 0}
     for index, item in enumerate(documents, start=1):
+        source_value, final_value = _document_urls(item)
         try:
-            url = normalize_scoped_url(_document_url(item), scope)
+            url = normalize_scoped_url(source_value, scope)
         except SiteError as exc:
             rejected_documents.append({"item_ref": f"crawl:{index}", "reason": exc.category})
             continue
@@ -1142,6 +1304,27 @@ def _write_execute_result(
             continue
         if url in accepted:
             rejected_documents.append({"item_ref": f"crawl:{index}", "reason": "duplicate"})
+            continue
+        # The final URL after redirects must stay in scope too; otherwise
+        # off-origin or out-of-prefix content would be archived under a signed URL.
+        final_url = None
+        if final_value is not None:
+            try:
+                final_url = normalize_scoped_url(final_value, scope)
+            except SiteError:
+                rejected_documents.append({"item_ref": f"crawl:{index}", "reason": "final_url_outside_scope"})
+                rejected_by_url.setdefault(url, "final_url_outside_scope")
+                continue
+        status_code_reported, status_code = _document_status_code(item)
+        if status_code_reported and status_code is None:
+            rejected_documents.append({"item_ref": f"crawl:{index}", "reason": "invalid_status_code"})
+            rejected_by_url.setdefault(url, "invalid_status_code")
+            continue
+        if status_code is not None and not 200 <= status_code < 300:
+            rejected_documents.append(
+                {"item_ref": f"crawl:{index}", "reason": "http_status_not_2xx", "status_code": status_code}
+            )
+            rejected_by_url.setdefault(url, "http_status_not_2xx")
             continue
         markdown = item.get("markdown") if isinstance(item, dict) else None
         if not isinstance(markdown, str) or not markdown.strip():
@@ -1158,23 +1341,39 @@ def _write_execute_result(
         content_path = item_dir / "content.md"
         metadata_path = item_dir / "metadata.json"
         _exclusive_write(content_path, content_bytes)
-        _exclusive_write(metadata_path, _canonical_json(_safe_metadata(item, url)) + b"\n")
+        _exclusive_write(
+            metadata_path,
+            _canonical_json(
+                _safe_metadata(
+                    item,
+                    url,
+                    final_url=final_url,
+                    status_code_reported=status_code_reported,
+                )
+            )
+            + b"\n",
+        )
         accepted[url] = [str(content_path), str(metadata_path)]
+        document_checks["final_url_missing"] += final_url is None
+        document_checks["status_code_missing"] += not status_code_reported
 
     manifest_lines: list[bytes] = []
     failures: list[dict[str, Any]] = []
     fetched_at = _timestamp(now)
     for position, url in enumerate(urls, start=1):
         success = url in accepted and crawl_error is None
-        reason = (
-            None
-            if success
-            else (
-                crawl_error.category
-                if crawl_error
-                else rejected_by_url.get(url, "not_returned_by_crawl")
-            )
-        )
+        error_category = None
+        if success:
+            reason = None
+        elif crawl_error:
+            reason = error_category = crawl_error.category
+        elif url in rejected_by_url:
+            reason = rejected_by_url[url]
+        elif partial_error:
+            # Pagination stopped before this URL could be returned.
+            reason = error_category = partial_error.category
+        else:
+            reason = "not_returned_by_crawl"
         row = {
             "item_ref": f"site-map:{position}",
             "platform": "web",
@@ -1188,13 +1387,13 @@ def _write_execute_result(
             "route_backend": "firecrawl-v2-bounded-site",
             "fetched_at": fetched_at,
             "reason": reason,
-            "error_category": crawl_error.category if crawl_error else None,
+            "error_category": error_category,
         }
         manifest_lines.append(_canonical_json(row) + b"\n")
         if not success:
             failure = {"item_ref": row["item_ref"], "stage": "crawl", "reason": reason}
-            if crawl_error:
-                failure["category"] = crawl_error.category
+            if error_category:
+                failure["category"] = error_category
             failures.append(failure)
     manifest_path = run_dir / "archive-manifest.jsonl"
     failures_path = run_dir / "failures.json"
@@ -1219,16 +1418,24 @@ def _write_execute_result(
         "crawl_job_ref": job_id,
         "counts": counts,
         "crawl_failure": (
-            None
-            if crawl_error is None
-            else {
+            {
                 "stage": "crawl",
                 "reason": crawl_error.category,
                 "category": crawl_error.category,
             }
+            if crawl_error is not None
+            else {
+                "stage": "crawl_pagination",
+                "reason": partial_error.category,
+                "category": partial_error.category,
+            }
+            if partial_error is not None
+            else None
         ),
+        "crawl_cancel": crawl_cancel,
         "failures": failures,
         "rejected_crawl_documents": rejected_documents,
+        "document_checks": document_checks,
         "policy": _fixed_policy(scope),
         "quota_exposure": _quota_exposure(scope),
         "preflight_audit": preflight_audit,
@@ -1323,6 +1530,40 @@ def _write_execute_result(
     }
 
 
+def _consume_preflight(
+    preflight: dict[str, Any], preflight_bytes: bytes, now: datetime
+) -> dict[str, str]:
+    """Atomically mark a signed preflight as used so it can start one Crawl only.
+
+    The marker lives in the signed source Map run, so copies of the preflight
+    (including the one inside a Crawl run) share it.
+    """
+
+    try:
+        source_run = Path(preflight["artifacts"]["run_dir"]).resolve(strict=True)
+    except (KeyError, TypeError, OSError):
+        raise SiteError("invalid_preflight", "Preflight source run is unavailable.") from None
+    marker_path = source_run / PREFLIGHT_CONSUMED_NAME
+    marker_bytes = _canonical_json(
+        {
+            "schema_version": "yichen-firecrawl-site-preflight-consumed/v1",
+            "preflight_run_id": preflight.get("run_id"),
+            "preflight_sha256": _sha256(preflight_bytes),
+            "consumed_at": _timestamp(now),
+        }
+    ) + b"\n"
+    try:
+        _exclusive_write(marker_path, marker_bytes)
+    except FileExistsError:
+        raise SiteError(
+            "preflight_already_used",
+            "This preflight already started a Crawl; run Map again for a new preflight.",
+        ) from None
+    except OSError:
+        raise SiteError("unsafe_output", "The preflight could not be marked as used.") from None
+    return {"path": str(marker_path), "sha256": _sha256(marker_bytes)}
+
+
 def run_execute(
     scope: Scope,
     *,
@@ -1334,11 +1575,14 @@ def run_execute(
     poll_seconds: float,
     now: datetime | None = None,
     sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
 ) -> dict[str, Any]:
     current = _utc_now() if now is None else now.astimezone(timezone.utc)
     verified_preflight, preflight_bytes, map_bytes, list_bytes, urls = _load_verified_preflight(
         preflight_path, scope=scope, api_key=api_key, now=current
     )
+    # Consume before any billed call; a replay fails here without starting a Crawl.
+    consumed_marker = _consume_preflight(verified_preflight, preflight_bytes, current)
     run_dir = _new_run_dir(output_root, "crawl", current)
     copied_preflight_path = run_dir / "preflight.json"
     copied_map_path = run_dir / "site-map.json"
@@ -1373,29 +1617,27 @@ def run_execute(
             },
         },
         "signed_source_paths_preserved_in_preflight_copy": True,
+        "consumed_marker": consumed_marker,
     }
-    job_id: str | None = None
-    documents: list[Any] = []
-    crawl_error: SiteError | None = None
-    try:
-        job_id, documents = _collect_crawl(
-            client,
-            _crawl_payload(scope),
-            timeout=crawl_timeout,
-            poll_seconds=poll_seconds,
-            sleep=sleep,
-        )
-    except SiteError as exc:
-        crawl_error = exc
+    outcome = _collect_crawl(
+        client,
+        _crawl_payload(scope),
+        timeout=crawl_timeout,
+        poll_seconds=poll_seconds,
+        sleep=sleep,
+        clock=clock,
+    )
     return _write_execute_result(
         run_dir=run_dir,
         scope=scope,
         urls=urls,
-        documents=documents,
-        job_id=job_id,
-        crawl_error=crawl_error,
+        documents=outcome.documents,
+        job_id=outcome.job_id,
+        crawl_error=outcome.error,
         now=current,
         preflight_audit=preflight_audit,
+        partial_error=outcome.partial_error,
+        crawl_cancel=outcome.cancel,
     )
 
 

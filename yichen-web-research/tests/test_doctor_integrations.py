@@ -278,22 +278,26 @@ class ZhihuDoctorTests(unittest.TestCase):
 
 
 class PortableIntegrationDoctorTests(unittest.TestCase):
-    def test_stepfun_key_check_never_executes_the_configured_script(self) -> None:
-        with mock.patch.dict(
-            os.environ,
-            {"YICHEN_STEP_ASR_SCRIPT": "/untrusted/step_asr.py"},
-            clear=True,
-        ):
-            self.assertFalse(doctor.stepfun_key_available())
-        with mock.patch.dict(
-            os.environ,
-            {
-                "YICHEN_STEP_ASR_SCRIPT": "/untrusted/step_asr.py",
-                "STEPFUN_API_KEY": "present-but-not-read",  # pragma: allowlist secret
-            },
-            clear=True,
-        ):
-            self.assertTrue(doctor.stepfun_key_available())
+    def test_step_prerequisites_come_only_from_the_asr_doctor_payload(self) -> None:
+        # Step script and key presence are reported by yichen-asr's own doctor;
+        # this doctor never imports or executes a configured Step script.
+        self.assertEqual(
+            doctor.step_asr_prerequisites(None),
+            {"step_asr": False, "stepfun_key": False},
+        )
+        self.assertEqual(
+            doctor.step_asr_prerequisites({"step": {"script_present": True}}),
+            {"step_asr": True, "stepfun_key": False},
+        )
+        self.assertEqual(
+            doctor.step_asr_prerequisites(
+                {"step": {"script_present": True, "credential_present": True}}
+            ),
+            {"step_asr": True, "stepfun_key": True},
+        )
+        source = Path(doctor.__file__).read_text(encoding="utf-8")
+        self.assertNotIn("YICHEN_STEP_ASR_SCRIPT", source)
+        self.assertNotIn("importlib", source)
 
     def test_firecrawl_private_file_check_reads_metadata_only(self) -> None:
         metadata = SimpleNamespace(

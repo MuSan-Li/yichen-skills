@@ -66,7 +66,7 @@ AI HOT 只在查询同时具有 AI 主题和明确时效意图，或用户直接
 |---|---|---|---|---|---|
 | GitHub | 公开仓库 | `gh search repos --visibility public` | `gh` 可使用本机凭据访问公共 API | 1–50 条请求候选 | 原生 CLI 计划 |
 | 知乎 | 公开关键词结果和显式热榜 | `zhihu_adapter.py` → 另行安装的 CLI 兼容运行时 | Keychain 管理凭据；结果标记为 `authenticated_public` | search 每词 10；batch 5 词；hot 30 | 统一候选包 |
-| 微信公众号 | 跨公众号公开文章候选 | `opencli weixin search` 公开路由 | 匿名 | 第 1 页；1–50 条请求候选 | 原生 CLI 计划 |
+| 微信公众号 | 跨公众号公开文章候选 | `opencli weixin search` 公开路由（搜狗，Browser Bridge 后台标签页） | 匿名 | 第 1 页；最多 10 条；结果只给会过期的搜狗跳转链接，读取正文需要 mp.weixin.qq.com 文章直链；多个 Browser Bridge profile 时传 `--opencli-profile` | 原生 CLI 计划 |
 | 微博 | 公开关键词博文候选 | `weibo_adapter.py`：先匿名移动端，再限定访问门回退 | 先匿名；符合访问门时才复用 Chrome | 3 页 / 20 条；batch 最多 5 词串行 | 统一候选包 |
 | 小红书 | 公开笔记关键词候选 | `opencli xiaohongshu search` | 可在该有界公开只读路由内复用已有 Chrome 会话 | 一次一词，20 条，步骤间隔至少 5 秒 | 原生 CLI 计划 |
 | 抖音 | 公开视频/帖子关键词候选 | `opencli douyin search` | 可在该有界公开只读路由内复用已有 Chrome 会话 | 一次一词，30 条，步骤间隔至少 5 秒 | 原生 CLI 计划 |
@@ -85,6 +85,7 @@ AI HOT 只在查询同时具有 AI 主题和明确时效意图，或用户直接
 
 - 当前原生路由只搜索**公开仓库**。
 - 查询放在 `--` 之后，防止查询文本被 `gh` 当成新的命令选项。
+- 命令请求含仓库 `url` 的 `--json` 输出；`[]` 才是零结果，空输出或非 JSON 按失败处理。
 - 不宣称支持 code、Issue 或 Pull Request 对象搜索，不 clone，不修改仓库。
 
 ### 知乎
@@ -136,7 +137,7 @@ AI HOT 只在查询同时具有 AI 主题和明确时效意图，或用户直接
 
 | 模式 | 适用场景 | 执行方式 | 停止条件 |
 |---|---|---|---|
-| Quick | 少量聚焦查询 | 每个 `--query` 各调用一次外层 `search_x_with_grok`；每次最多 20 条 | 执行完指定查询，或主路由发生任何故障 |
+| Quick | 少量聚焦查询 | 每个 `--query` 各调用一次外层 `search_x_with_grok`，每个计划去重后最多 8 个查询；每次最多 20 条 | 执行完指定查询，或主路由发生任何故障 |
 | Research | 更广、可审计的 X 覆盖 | 至少 3 个互不重复的聚焦查询；每波最多 5 个；离线合并并按 `tweet_id` 去重 | 达到目标、无实质缺口、补搜无新增、已用 1 轮补搜、达到 40 次上限，或主链发生非额度故障 |
 
 时间窗口只支持 1–7 天。Repost/Reply、作者、语言、互动阈值和排序参数会指导检索，
@@ -226,7 +227,11 @@ python3 "$YICHEN_SKILLS_ROOT/yichen-unified-search/scripts/route_search.py" \
   --query "https://example.com/docs/" --platform web --mode site-map --limit 100
 ```
 
-只执行计划中实际生成的 `steps`。完整命令形状和路由门槛见
+只执行计划中实际生成的 `steps`，把每个 `argv` 数组逐元素交给进程，不要拼成 shell 字符串。
+所有拒绝（包括 CLI 参数错误）都输出同一 `invalid_request` JSON 并以退出码 2 结束。CLI 的
+`--days` 接受 0–3650（各平台最大值），再由各平台收窄；没有时间过滤的平台会在 `limitations`
+注明未应用。`--domain`/`--hybrid` 只能配 `--platform web`，原生平台会拒绝而不是改走 AnySearch。
+完整命令形状和路由门槛见
 [`references/routes.md`](references/routes.md)。
 
 ## 安装与按需依赖

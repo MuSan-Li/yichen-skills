@@ -5,7 +5,7 @@ import json
 import sys
 import unittest
 from argparse import Namespace
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from unittest import mock
 from urllib.error import URLError
@@ -31,6 +31,87 @@ class IntentRegressionTests(unittest.TestCase):
                     self.assertEqual(explicit['status'],'invalid_request')
                     self.assertEqual(explicit['steps'],[])
 
+    def test_relative_and_calendar_time_windows(self):
+        # 2026-10-31 review: these all silently became --days 1. Saturday 2026-10-31.
+        today = date(2026, 10, 31)
+        for wording, days in [('过去两周', 14), ('最近两个星期', 14), ('上周', 13), ('本周', 7),
+                              ('这个月', 31), ('本月', 31), ('上个月', 61), ('半个月', 15),
+                              ('过去48小时', 2), ('24小时', 1), ('近3日', 3), ('最近三个月', 90),
+                              ('past week', 7), ('last week', 13), ('last 2 weeks', 14),
+                              ('past 48 hours', 2), ('this month', 31), ('last month', 61),
+                              ('最近30 days', 30), ('past few days', 7)]:
+            with self.subTest(wording=wording):
+                self.assertEqual(ROUTER.infer_aihot_days(wording + ' AI 新闻', None, today=today), days)
+        self.assertEqual(ROUTER.infer_aihot_days('上周 AI 新闻', None, today=date(2026, 10, 26)), 8)
+
+    def test_unparseable_time_wording_requires_explicit_days(self):
+        for query in ['最近几周 AI 新闻', '上季度 AI 动态', 'past few weeks AI news',
+                      '2025年 AI 大模型 新闻', '10月 AI 新闻', '上半年 AI 发布']:
+            with self.subTest(query=query):
+                with self.assertRaises(ValueError):
+                    ROUTER.infer_time_window(query)
+                for platform in ('auto', 'aihot'):
+                    result = ROUTER.plan(request(queries=(query,), platform=platform))
+                    self.assertEqual(result['status'], 'invalid_request')
+                    self.assertIn('--days', result['reason'])
+                    self.assertEqual(result['steps'], [])
+                explicit = ROUTER.plan(request(queries=(query,), platform='aihot', days=3))
+                self.assertEqual(explicit['status'], 'ready')
+                argv = explicit['steps'][0]['argv']
+                self.assertEqual(argv[argv.index('--days') + 1], '3')
+
+    def test_ordinary_ai_wording_is_not_mistaken_for_time_windows(self):
+        for query in ['GPT-4o 最新功能', '月之暗面 Kimi 最新动态', 'Qwen3 最新发布', '日本 AI 新闻',
+                      '本年度 AI 报告 最新', '5G AI 最新进展']:
+            with self.subTest(query=query):
+                self.assertIsNone(ROUTER.infer_time_window(query))
+
+    def test_inferred_days_are_reported_in_limitations(self):
+        result = ROUTER.plan(request(queries=('过去48小时 AI 新闻',)))
+        self.assertEqual(result['route']['backend'], 'aihot')
+        argv = result['steps'][0]['argv']
+        self.assertEqual(argv[argv.index('--days') + 1], '2')
+        self.assertIn("--days 2 was inferred from '48小时'", ' '.join(result['limitations']))
+        default = ROUTER.plan(request(queries=('AI 最新动态',)))
+        self.assertIn('default 1-day window', ' '.join(default['limitations']))
+        with mock.patch.object(ROUTER, '_today', return_value=date(2026, 10, 31)):
+            calendar = ROUTER.plan(request(queries=('昨天 AI 发布了什么',)))
+        self.assertIn('calendar period', ' '.join(calendar['limitations']))
+
+    def test_long_inferred_windows_follow_existing_aihot_range_rule(self):
+        for query in ['过去两周 AI 新闻', '上个月 AI 动态', 'last 3 weeks AI news']:
+            with self.subTest(query=query):
+                auto = ROUTER.plan(request(queries=(query,)))
+                self.assertEqual(auto['route']['backend'], 'anysearch')
+                joined = ' '.join(auto['limitations'])
+                self.assertIn('was inferred from', joined)
+                self.assertIn('latest 7 days', joined)
+                explicit = ROUTER.plan(request(queries=(query,), platform='aihot'))
+                self.assertEqual(explicit['status'], 'invalid_request')
+                self.assertEqual(explicit['reason'], 'AI HOT item windows must be between 1 and 7 days')
+                self.assertIn('was inferred from', ' '.join(explicit['limitations']))
+                self.assertEqual(explicit['steps'], [])
+
+    def test_aihot_intent_is_judged_per_query_in_search_and_batch(self):
+        # An AI topic in one query plus freshness wording in another is not AI HOT intent.
+        split = ('AI 研究方法', '最新 半导体 新闻')
+        self.assertFalse(ROUTER.is_aihot_intent(split))
+        self.assertTrue(ROUTER.is_aihot_intent(('今天 AI 新闻', '最近 OpenAI 发布')))
+        for mode in ('search', 'batch'):
+            with self.subTest(mode=mode):
+                result = ROUTER.plan(request(queries=split, mode=mode))
+                self.assertEqual(result['route']['backend'], 'anysearch')
+                self.assertNotIn('AI HOT', ' '.join(result['limitations']))
+        both = ROUTER.plan(request(queries=('今天 AI 新闻', '最近 OpenAI 发布')))
+        self.assertEqual(both['route']['backend'], 'aihot')
+        self.assertEqual(len(both['steps']), 2)
+        mixed = ROUTER.plan(request(queries=('今天 AI 圈有什么新动态', '全球半导体供应链')))
+        self.assertEqual(mixed['route']['backend'], 'anysearch')
+        self.assertIn('Only query 1 has AI HOT intent', ' '.join(mixed['limitations']))
+        batch = ROUTER.plan(request(queries=('今天 AI 新闻', '最近 OpenAI 发布'), mode='batch'))
+        self.assertEqual(batch['route']['backend'], 'anysearch')
+        self.assertIn('query 1, 2 looks like an AI HOT request', ' '.join(batch['limitations']))
+
     def test_explicit_days_override_inferred_days(self):
         result=ROUTER.plan(request(queries=('过去30天 AI 新闻',),days=3))
         argv=result['steps'][0]['argv']
@@ -55,9 +136,10 @@ class IntentRegressionTests(unittest.TestCase):
             self.assertEqual(len(result['query_routes']),len(queries))
 
     def test_company_subject_is_not_channel_and_issue_is_not_github(self):
-        for query in ['微博公司的最新财报','微博财报','Weibo stock earnings','how to resolve a housing issue']:
+        for query in ['微博公司的最新财报','微博财报','Weibo stock earnings','how to resolve a housing issue',
+                      '微博上市时间','微博IPO','知乎融资历史','Weibo IPO date']:
             self.assertEqual(ROUTER.plan(request(queries=(query,)))['route']['backend'],'anysearch')
-        for query in ['微博上的最新讨论','latest Weibo posts about iPhone','在微博搜索财报']:
+        for query in ['微博上的最新讨论','latest Weibo posts about iPhone','在微博搜索财报','在微博上搜微博上市时间']:
             self.assertEqual(ROUTER.plan(request(queries=(query,)))['route']['backend'],'weibo-readonly-auto')
 
     def test_explicit_platform_remains_authoritative(self):

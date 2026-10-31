@@ -4,6 +4,7 @@ import os
 import pathlib
 import sys
 import unittest
+import urllib.parse
 import urllib.request
 from datetime import datetime
 from unittest import mock
@@ -102,6 +103,15 @@ def raw_post(
 
 
 class WeiboAdapterTests(unittest.TestCase):
+
+    def test_follower_display_counts_with_units_are_kept_as_approximate(self):
+        self.assertEqual(WEIBO.display_count("1.2万"), (12000, True))
+        self.assertEqual(WEIBO.display_count("1234.5万"), (12345000, True))
+        self.assertEqual(WEIBO.display_count("3亿"), (300000000, True))
+        self.assertEqual(WEIBO.display_count(42), (42, False))
+        self.assertEqual(WEIBO.display_count("42"), (42, False))
+        self.assertEqual(WEIBO.display_count("很多"), (None, False))
+        self.assertEqual(WEIBO.display_count(-1), (None, False))
     def setUp(self):
         self.now = datetime(2026, 8, 24, 14, 30, tzinfo=WEIBO.TZ)
 
@@ -234,8 +244,14 @@ class WeiboAdapterTests(unittest.TestCase):
     def test_malformed_or_rejected_upstream_is_not_zero_results(self):
         visitor = b'visitor_callback({"data":{"sub":"anon","subp":"anonp"}});'
         scenarios = (
-            (b"<html>verification</html>", "access_gate_response"),
-            (json.dumps({"ok": 0, "msg": "访问受限"}).encode(), "access_gate_rejected"),
+            (b"<html>verification</html>", "invalid_response"),
+            (json.dumps({"ok": 0, "msg": "访问受限"}).encode(), "upstream_rejected"),
+            (
+                json.dumps(
+                    {"ok": -100, "url": "https://passport.weibo.cn/signin/welcome?entry=mweibo"}
+                ).encode(),
+                "access_gate_rejected",
+            ),
         )
         for payload, category in scenarios:
             with self.subTest(category=category):
@@ -258,6 +274,219 @@ class WeiboAdapterTests(unittest.TestCase):
                 self.assertEqual(result["candidates"], [])
                 self.assertEqual(result["errors"][0]["category"], category)
                 self.assertTrue(result["coverage"][0]["truncated"])
+
+    def public_client(self, *payloads):
+        visitor = b'visitor_callback({"data":{"sub":"anon","subp":"anonp"}});'
+        opener = FakeOpener([visitor, *payloads])
+        client = WEIBO.WeiboPublicClient(
+            opener=opener,
+            delay_min=0,
+            delay_max=0,
+            sleeper=lambda _: None,
+        )
+        return client, opener
+
+    def run_auto(self, client, runner, *, max_pages=1, days=None, opencli_profile=None):
+        return WEIBO.run_search_auto(
+            query="iPhone 18",
+            limit=10,
+            max_pages=max_pages,
+            days=days,
+            timeout=30,
+            now=self.now,
+            session_mode="auto",
+            client=client,
+            runner=runner,
+            opencli_path="/safe/opencli",
+            opencli_profile=opencli_profile,
+        )
+
+    def test_access_gate_fallback_uses_structural_signals_only(self):
+        passport = "https://passport.weibo.cn/signin/welcome?entry=mweibo"
+        scenarios = (
+            ("login_required_code", {"ok": -100, "url": passport}, "access_gate_rejected", True),
+            ("login_required_code_only", {"ok": "-100"}, "access_gate_rejected", True),
+            ("login_host_url", {"ok": 0, "url": passport}, "access_gate_rejected", True),
+            ("parameter_check_message", {"ok": 0, "msg": "参数验证失败"}, "upstream_rejected", False),
+            ("gate_words_in_message", {"ok": 0, "msg": "请先登录后验证"}, "upstream_rejected", False),
+            ("non_login_url", {"ok": 0, "url": "https://m.weibo.cn/detail/1"}, "upstream_rejected", False),
+            (
+                "html_mentioning_passport",
+                b"<html>502 Bad Gateway<script src='https://passport.weibo.cn/js/sso.js'></script>login</html>",
+                "invalid_response",
+                False,
+            ),
+        )
+        for name, payload, category, falls_back in scenarios:
+            with self.subTest(name):
+                body = payload if isinstance(payload, bytes) else json.dumps(payload).encode()
+                client, _ = self.public_client(body)
+                runner = FakeRunner(FakeCompleted(stdout="[]"))
+                result = self.run_auto(client, runner)
+                self.assertEqual(len(runner.calls), 1 if falls_back else 0)
+                self.assertEqual(result["errors"][0]["category"], category)
+                self.assertEqual(result["candidates"], [])
+
+    def test_login_host_detection_rejects_lookalike_hosts(self):
+        self.assertTrue(WEIBO.is_login_host_url("https://passport.weibo.cn/signin/welcome"))
+        self.assertTrue(WEIBO.is_login_host_url("https://visitor.passport.weibo.cn/visitor/visitor"))
+        self.assertTrue(WEIBO.is_login_host_url("https://login.sina.com.cn/sso/login.php"))
+        for value in (
+            "https://passport.weibo.cn.attacker.example/",
+            "https://m.weibo.cn/login",
+            "https://passportweibo.cn/",
+            "javascript:passport.weibo.cn",
+            "/signin/welcome",
+            None,
+        ):
+            with self.subTest(value=value):
+                self.assertFalse(WEIBO.is_login_host_url(value))
+
+    def test_empty_ok_zero_page_ends_pagination_without_error(self):
+        first = {"ok": 1, "data": {"cards": [{"card_type": 9, "mblog": raw_post("1234567890123456")}]}}
+        end_variants = (
+            {"ok": 0, "msg": "这里还没有内容", "data": {"cards": []}},
+            {"ok": 0, "msg": "这里还没有内容"},
+        )
+        for end in end_variants:
+            with self.subTest(end=end):
+                client, opener = self.public_client(
+                    json.dumps(first).encode(), json.dumps(end).encode()
+                )
+                result = self.run_auto(
+                    client,
+                    lambda *_args, **_kwargs: self.fail("end of results must not fall back"),
+                    max_pages=3,
+                )
+                self.assertEqual(result["errors"], [])
+                self.assertEqual(result["routes"][0]["status"], "completed")
+                self.assertEqual(len(result["candidates"]), 1)
+                self.assertEqual(result["coverage"][0]["pages_completed"], 2)
+                self.assertFalse(result["coverage"][0]["truncated"])
+                # Visitor + two pages; the empty page stops pagination.
+                self.assertEqual(len(opener.requests), 3)
+
+    def test_ok_zero_with_cards_is_still_a_rejection(self):
+        payload = {"ok": 0, "msg": "", "data": {"cards": [{"card_type": 9, "mblog": raw_post("1234567890123456")}]}}
+        client, _ = self.public_client(json.dumps(payload).encode())
+        result = self.run_auto(client, FakeRunner(FakeCompleted()))
+        self.assertEqual(result["errors"][0]["category"], "upstream_rejected")
+
+    def test_fallback_without_candidates_keeps_anonymous_gate_error(self):
+        gate = json.dumps({"ok": -100}).encode()
+        rejected_rows = [
+            {"id": "", "title": "帖子", "author": "a", "time": "今天 10:00", "url": "https://m.weibo.cn/status/ReGT8un2O"}
+        ]
+        scenarios = (
+            ("empty_list", "[]", ["access_gate_rejected"]),
+            ("all_rows_rejected", json.dumps(rejected_rows), ["access_gate_rejected", "browser_rows_rejected"]),
+        )
+        for name, stdout, categories in scenarios:
+            with self.subTest(name):
+                client, _ = self.public_client(gate)
+                result = self.run_auto(client, FakeRunner(FakeCompleted(stdout=stdout)))
+                self.assertEqual([error["category"] for error in result["errors"]], categories)
+                self.assertEqual(result["candidates"], [])
+                self.assertFalse(result["routes"][0]["browser_fallback_recovered"])
+                self.assertEqual(result["routes"][0]["recovered_error_categories"], ["access_gate_rejected"])
+
+    def test_browser_rows_outside_window_do_not_count_as_recovery(self):
+        rows = [
+            {
+                "author": "测试作者",
+                "id": "ReGT8un2O",
+                "time": "2026-01-01 09:54",
+                "title": "旧帖子",
+                "url": "https://weibo.com/1563458343/ReGT8un2O",
+            }
+        ]
+        client, _ = self.public_client(json.dumps({"ok": -100}).encode())
+        result = self.run_auto(client, FakeRunner(FakeCompleted(stdout=json.dumps(rows))), days=7)
+        self.assertEqual([error["category"] for error in result["errors"]], ["access_gate_rejected"])
+        self.assertFalse(result["routes"][0]["browser_fallback_recovered"])
+
+    def test_containerid_keeps_reserved_characters_inside_the_keyword(self):
+        empty = json.dumps({"ok": 1, "data": {"cards": []}}).encode()
+        for keyword, expected in (("AT&T 5G", "100103type=1&q=AT%26T 5G"), ("苹果 #发布会#", "100103type=1&q=苹果 %23发布会%23"), ("C++ 100%", "100103type=1&q=C%2B%2B 100%25")):
+            with self.subTest(keyword=keyword):
+                client, opener = self.public_client(empty)
+                client.search_page(keyword, 1)
+                url = opener.requests[-1][0].full_url
+                containerid = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)["containerid"][0]
+                self.assertEqual(containerid, expected)
+                inner = urllib.parse.parse_qs(containerid)
+                self.assertEqual(inner["q"], [keyword])
+                self.assertEqual(inner["100103type"], ["1"])
+        self.assertEqual(WEIBO.containerid_for("iPhone 18"), "100103type=1&q=iPhone 18")
+
+    def test_leap_day_month_day_labels_do_not_crash(self):
+        early_leap_year = datetime(2028, 1, 10, 12, 0, tzinfo=WEIBO.TZ)
+        self.assertIsNone(WEIBO.parse_weibo_datetime("02-29 10:00", early_leap_year))
+        self.assertIsNone(WEIBO.parse_weibo_datetime("02月29日 10:00", early_leap_year))
+        after_leap_day = datetime(2028, 3, 1, 12, 0, tzinfo=WEIBO.TZ)
+        self.assertEqual(
+            WEIBO.parse_weibo_datetime("02-29 10:00", after_leap_day),
+            datetime(2028, 2, 29, 10, 0, tzinfo=WEIBO.TZ),
+        )
+        self.assertEqual(
+            WEIBO.parse_weibo_datetime("12-30 10:00", early_leap_year),
+            datetime(2027, 12, 30, 10, 0, tzinfo=WEIBO.TZ),
+        )
+
+    def test_opencli_profile_is_forwarded_as_global_option_and_env(self):
+        runner = FakeRunner(FakeCompleted(stdout="[]"))
+        with mock.patch.dict(
+            os.environ,
+            {"PATH": "/usr/bin:/bin", "OPENCLI_PROFILE": "work", "BROWSER_COOKIE": "cookie-secret"},  # pragma: allowlist secret
+            clear=True,
+        ):
+            WEIBO.run_browser_search(
+                query="iPhone 18",
+                limit=3,
+                days=None,
+                timeout=30,
+                now=self.now,
+                runner=runner,
+                opencli_path="/safe/opencli",
+                opencli_profile="Profile_2",
+            )
+        command, kwargs = runner.calls[0]
+        self.assertEqual(
+            command[:6], ["/safe/opencli", "--profile", "Profile_2", "weibo", "search", "iPhone 18"]
+        )
+        self.assertEqual(kwargs["env"], {"PATH": "/usr/bin:/bin", "OPENCLI_PROFILE": "work"})
+        default = FakeRunner(FakeCompleted(stdout="[]"))
+        WEIBO.run_browser_search(
+            query="iPhone 18", limit=3, days=None, timeout=30, now=self.now,
+            runner=default, opencli_path="/safe/opencli",
+        )
+        self.assertEqual(default.calls[0][0][:3], ["/safe/opencli", "weibo", "search"])
+        args = WEIBO.parse_args(["search", "--query", "q", "--opencli-profile", "Default"])
+        self.assertEqual(args.opencli_profile, "Default")
+
+    def test_option_like_query_or_profile_never_reaches_opencli(self):
+        for argv in (
+            ["search", "--query=-rf"],
+            ["search", "--query=  --help"],
+            ["search", "--query", "q", "--opencli-profile=-x"],
+            ["search", "--query", "q", "--opencli-profile", "bad name"],
+        ):
+            with self.subTest(argv=argv), self.assertRaises(SystemExit), mock.patch("sys.stderr"):
+                WEIBO.parse_args(argv)
+        for query, profile in (("-rf", None), ("q", "--help")):
+            with self.subTest(query=query, profile=profile):
+                result = WEIBO.run_browser_search(
+                    query=query,
+                    limit=3,
+                    days=None,
+                    timeout=30,
+                    now=self.now,
+                    runner=lambda *_args, **_kwargs: self.fail("OpenCLI must not run"),
+                    opencli_path="/safe/opencli",
+                    opencli_profile=profile,
+                )
+                self.assertEqual(result["errors"][0]["category"], "invalid_request")
+                self.assertFalse(result["routes"][0]["login_state_used"])
 
     def test_explicit_network_failure_is_reported(self):
         client = StubClient(

@@ -13,7 +13,7 @@ description: 按用户当轮要求读取、下载或归档已知网页/社交媒
 
 - 用户当轮直接给出的一个或多个内容 URL。
 - 用户给出的本地 URL 文件。
-- 上游产物中逐项标为 `confirmed` 的候选，或用户当轮明确选中的候选。
+- 用户当轮明确选中的上游候选（`confirmed_candidates`），例如从 `$yichen-unified-search` 结果中按序号或链接点名的条目。搜索结果的 `verification.status`（包括 `verified`）只表示核验状态，不等于用户确认，不能据此归档。
 - 用户明确指定的 `known_collection`：URL 文件、YouTube/B站播放列表、已知小宇宙播客或 episode 清单；公众号账号名/历史容器不再是可枚举容器。
 - 用户明确指定的有界站点容器：公开 HTTPS `site-url`、精确 `path-prefix`、`limit <= 100` 和 `max-depth <= 3`；默认只运行 Map，Crawl 还必须显式传 `--execute --preflight <file>`。
 - `$yichen-bookmarks-export` 生成的链接文件，但只有用户另行明确要求读取、下载或归档后才可使用。
@@ -31,7 +31,7 @@ description: 按用户当轮要求读取、下载或归档已知网页/社交媒
 5. 不得删除任何文件。目标存在时创建不冲突的新目录或文件名，不静默覆盖。
 6. 不得打印或写入普通日志中的 Cookie、Token、登录凭证或带敏感查询参数的完整 URL。
 7. 不得绕过登录、验证码、付费墙、删除状态、地区限制或访问控制。
-8. 微信公众号路线只处理已知公开文章 URL；公众号账号搜索、完整历史和最新 N 篇自 2026-07-30 起不可用，不得通过登录、本地部署或代理回退。绝对不得操控微信客户端。
+8. 微信公众号路线只处理已知公开文章 URL；公众号账号搜索、完整历史和最新 N 篇不在本 Skill 范围内，不得通过登录、本地部署或代理回退。用户需要整号历史、历史文章列表或阅读/评论等互动数据时，告诉用户改用 `$yichen-wechat-mp-batch-exporter`（它要求用户本人完成公众号后台登录或凭证授权），本 Skill 不代为调用。绝对不得操控微信客户端。
 9. Twitter/X 已知链接先走 FxTwitter → Jina 匿名公共读取。只有匿名路线失败或 Article 正文不完整时，才列出 OpenCLI → xreach 回退；执行任何一个登录态回退前必须针对当前链接取得当轮明确授权。
 10. 小红书默认匿名读取。只有当前笔记匿名解析或媒体下载失败，且用户对该目标当轮明确授权后，才可从私有配置向子进程注入 `XHS_COOKIE` 并显式传 `--use-cookie`；不得读取、打印或保存 Cookie。
 11. 微博只处理用户已提供的公开单条内容 URL。固定使用 `weibo_known_url.py` 的匿名访客路线，不读取浏览器 Cookie、用户配置或登录态；不得把 `/u/<uid>?layerid=<id>` 原样交给 `yt-dlp`，不得枚举账号视频页、搜索、热榜、评论或推荐内容。
@@ -52,22 +52,22 @@ description: 按用户当轮要求读取、下载或归档已知网页/社交媒
 - 是否需要登录态；如需要，必须按目标平台或本 Skill 对应执行器的规则取得当轮授权。
 - 是否明确要求把小红书素材写入飞书多维表格；没有明确要求时只做本地读取、下载或归档。
 
-候选只有在上游明确标记或用户当轮选择后才算 `confirmed`。只存在标题或关键词不算可执行输入。频道名或播客名只有在用户明确把它指定为受支持的 `known_collection` 容器，并给出范围后才可用于容器解析；不得作为搜索词扩展其他结果。公众号名称不能触发历史枚举。
+候选只有在用户当轮明确选择后才算 `confirmed`；上游没有、也不能代用户写入确认标记。只存在标题或关键词不算可执行输入。频道名或播客名只有在用户明确把它指定为受支持的 `known_collection` 容器，并给出范围后才可用于容器解析；不得作为搜索词扩展其他结果。公众号名称不能触发历史枚举。
 
 ### 2. 选择单个平台路由
 
 读取 [平台路由](references/platform-routes.md) 中目标平台对应行与适用纪律，再读取该路线指定的现有平台 Skill、参考文件或脚本帮助；不为单个平台加载所有平台细节。只调用允许的已知链接/精确容器路径：
 
-- 普通网页：Jina Reader / Web Reader；只读用户给出的 HTTP(S) URL，不做站点爬取。
+- 普通网页：Jina Reader / Web Reader；只读用户给出的 HTTP(S) URL，不做站点爬取。Jina 输出原样保留页面里的链接，可能带页面自带的令牌参数（如知乎的 `zd_token`）；归档或转述前去掉这类参数，不在摘要里重复完整值。
 - 有界站点：本 Skill `firecrawl_site.py`；默认 Map 只生成签名预检与过滤后的 URL 清单，只有同参数、未过期、内容哈希仍匹配的 `--execute --preflight <file>` 才调用 Firecrawl v2 Crawl。
 - Twitter/X：本 Skill `x_known_url.py` 识别已知 Post、Quote 与 Article；匿名 FxTwitter 优先，必要时匿名 Jina。用户明确要求下载视频时，用 `known_media_download.py` 选择该帖公开返回的最高码率 MP4；登录态 OpenCLI/xreach 只作授权后的读取回退。
 - 小红书：本 Skill `xiaohongshu_fetch.py`；`--skip-media` 只读 HTML 与元数据，去掉该参数才下载已知笔记媒体，授权后才可 `--use-cookie`。明确要求沉淀到飞书时再读取 [references/xiaohongshu-bitable.md](references/xiaohongshu-bitable.md)。
 - 抖音：本 Skill `douyin_download.py`；`--metadata-only` 只读元数据，去掉该参数才下载已知视频。
 - 微博：本 Skill `weibo_known_url.py` 的 `info` 或 `download`；先把用户给出的单条 overlay/status URL 规范为精确详情 URL，再匿名读取或下载，不得把账号页交给裸 `yt-dlp`。
-- 微信公众号：所有已知公开文章 URL（单篇或 URL 文件）统一用 `$yichen-wechat-mp-batch-exporter`；公众号名称、完整历史和最新 N 篇一律标记 `unsupported`，不得调用本机 `search`、登录、下载或代理回退。
-- YouTube：本 Skill `youtube_known_url.py` 的 `info`、`download`、`subtitles` 和 `playlist`；只接受明确视频/播放列表 URL，不搜索或浏览频道。
-- B站：`bili-cli` 读取已知 BV/AV/完整 URL，`yt-dlp` 下载；已知播放列表先平铺枚举。
-- 小宇宙：`xiaoyuzhou_stepfun.py` 匿名读取/下载已知 episode；已知播客清单仅在当轮授权后用 `xiaoyuzhou_opencli.py` 枚举，再回到匿名批量下载。
+- 微信公众号：本 Skill `wechat_known_url.py`；`read <URL>` 只读单篇并输出 JSON，`download <URL>` 或 `download --url-file <文件> [--limit N]` 写入新 run 目录（`--limit` 默认 50、最多 100）。只接受 `/s/<id>` 与 `/s?__biz=&mid=&idx=&sn=` 单篇文章链接；公众号名称、主页、历史、合集和最新 N 篇一律标记 `unsupported`，不得登录、代理回退或操控微信客户端。图文页（item_show_type=8，无 `#js_content`）改读页面数据里的描述文字与有序图片列表，记 `content_type: image_post`；视频、音频、纯文字等其他分享页尚未取样，仍记 `missing_content`。
+- YouTube：本 Skill `youtube_known_url.py` 的 `info`、`download`、`subtitles` 和 `playlist`；只接受明确视频 URL 与用户自建播放列表（`PL`/`OLAK` 前缀），拒绝 RD（推荐 Mix）、UU（频道全部上传）等系统生成列表，不搜索或浏览频道。
+- B站：`bili`（bili-cli）读取已知 BV/AV/完整 URL；下载走本 Skill `known_media_download.py`，只接受完整 `www.bilibili.com/video/` 链接；已知播放列表用带 `--ignore-config`、`--no-cookies` 和数量上限的 `yt-dlp --flat-playlist` 平铺枚举，命令见平台路由。
+- 小宇宙：`xiaoyuzhou_stepfun.py` 匿名读取/下载已知 episode，只接受 `https://www.xiaoyuzhoufm.com/episode/<id>`；默认下载后用 StepFun 转写（付费），`--download-only` 只下载不转写。首次转写前如果输出里有 `first_use_choice_available: true`，先问用户一次：StepFun（付费、快）还是本地 Whisper（免费、较慢，首次需 `uv tool install mlx-whisper` 并下载模型），再用 `--set-asr-engine stepfun|whisper` 保存偏好（保存在 `$yichen-asr` 的共用偏好 `~/.config/yichen-asr/preference.json`，对所有经 yichen-asr 的转写生效）；之后按 `--asr-engine` 参数 > 偏好文件 > 默认 StepFun 的顺序选择引擎。转写实现由 `$yichen-asr` 负责。批量 StepFun 转写须加 `--max-transcribe N`（N 不小于节目数），Whisper 不需要。已知播客清单仅在当轮授权后用 `xiaoyuzhou_opencli.py` 枚举，再回到匿名批量下载。
 - 其他公开媒体平台：用户明确给出单条公开 HTTPS 内容 URL 并要求下载视频或音频时，用 `known_media_download.py` 的匿名 `yt-dlp --no-playlist` 兜底；不得把关键词、主页、频道、搜索结果或播放列表伪装成单项 URL。
 
 目标平台没有专用路由时，单条公开 HTTPS 媒体下载进入 `known_media_download.py`；其他动作或精确容器无法由现有后端处理时，将该项记为 `unsupported`，不要转给总路由、自行发明抓取实现或降级成搜索。登录态、账号枚举、播放列表和跨来源扩展仍必须另行满足对应授权与路由规则。
@@ -110,7 +110,7 @@ Agent 禁止自动使用兼容 `--overwrite`；小宇宙覆盖仍须用户当轮
 {"item_ref":"opaque-or-line-ref","platform":"xiaohongshu","source_url_ref":"input.txt:3","requested_actions":["archive"],"status":"success","artifact_paths":["/absolute/path"],"route_backend":"xiaohongshu-known-url","fetched_at":"RFC3339"}
 ```
 
-容器条目额外记录 `container_ref`、`container_position` 和 `enumeration_status`。后端不是 Skill 时使用 `route_backend`，例如 `jina-reader`、`weibo-known-url`、`youtube-known-url`、`yt-dlp` 或 `xiaoyuzhou-stepfun`。
+容器条目额外记录 `container_ref`、`container_position` 和 `enumeration_status`。后端不是 Skill 时使用 `route_backend`，例如 `jina-reader`、`weibo-known-url`、`youtube-known-url`、`wechat-known-url`、`yt-dlp` 或 `xiaoyuzhou-stepfun`。
 
 敏感 URL 优先使用文件行号引用，不在摘要、聊天或普通日志中重复完整值。缺失字段写 `null`，不得推断补齐。
 

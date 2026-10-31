@@ -37,6 +37,11 @@ UNKNOWN_REPLY_LIMITATION = (
     "reply marker was present."
 )
 ENGAGEMENT_FORMULA = "likes + reposts + replies"
+MAX_OUTER_SEARCHES = 40
+UNKNOWN_FILTER_LIMITATION = (
+    "Filter field(s) unknown for this candidate and not verified: {fields}; "
+    "it was retained instead of being filtered."
+)
 
 
 class MergeError(RuntimeError):
@@ -118,7 +123,7 @@ def _numeric_id(value: Any) -> str | None:
     text = _text(value)
     if text is None:
         return None
-    if text.isdigit():
+    if text.isascii() and text.isdigit():
         return str(int(text))
     prefixed = CANDIDATE_ID_RE.fullmatch(text)
     if prefixed:
@@ -787,6 +792,127 @@ def _validate_merge_arguments(
             )
 
 
+def _call_budget(envelopes: list[dict[str, Any]]) -> dict[str, Any]:
+    """Enforce the outer-search budget and the single gap-fill round.
+
+    Calls are identified by the ``call_index`` that the Grok adapter writes on
+    each route.  Re-merging a previous merge output re-reads the same routes, so
+    repeated indices are deduplicated; an index reused for a different query or
+    phase is rejected.
+    """
+
+    calls: dict[int, dict[str, str | None]] = {}
+    untracked_search_routes = 0
+    prior_supplementary_sets: set[frozenset[int]] = set()
+    for input_index, envelope in enumerate(envelopes, start=1):
+        source = f"input {input_index}"
+        for coverage in envelope.get("coverage", []):
+            if not isinstance(coverage, dict) or coverage.get("backend") != BACKEND:
+                continue
+            budget = coverage.get("search_budget")
+            indices = (
+                budget.get("supplementary_call_indices")
+                if isinstance(budget, dict)
+                else None
+            )
+            if isinstance(indices, list) and indices:
+                prior_supplementary_sets.add(
+                    frozenset(
+                        value
+                        for value in indices
+                        if isinstance(value, int) and not isinstance(value, bool)
+                    )
+                )
+        for route in envelope.get("routes", []):
+            if not isinstance(route, dict) or route.get("backend") == BACKEND:
+                continue
+            call_index = route.get("call_index")
+            if call_index is None:
+                if route.get("mode") == "search_x_with_grok":
+                    untracked_search_routes += 1
+                continue
+            if (
+                isinstance(call_index, bool)
+                or not isinstance(call_index, int)
+                or call_index < 1
+            ):
+                raise MergeError(
+                    "invalid_call_index",
+                    "Route call_index must be a positive integer.",
+                    source,
+                )
+            phase = route.get("phase")
+            phase = phase if phase in {"initial", "supplementary"} else None
+            query = _text(route.get("query"))
+            known = calls.setdefault(call_index, {"phase": phase, "query": query})
+            for field, value in (("phase", phase), ("query", query)):
+                if value is None:
+                    continue
+                if known[field] is None:
+                    known[field] = value
+                elif known[field] != value:
+                    raise MergeError(
+                        "conflicting_call_index",
+                        f"call_index {call_index} is used by searches with different {field} values.",
+                        source,
+                    )
+
+    if len(calls) > MAX_OUTER_SEARCHES or any(
+        index > MAX_OUTER_SEARCHES for index in calls
+    ):
+        raise MergeError(
+            "search_budget_exceeded",
+            f"The inputs contain {len(calls)} outer searches (highest call_index "
+            f"{max(calls)}); X Research allows at most {MAX_OUTER_SEARCHES}.",
+        )
+    initial = sorted(index for index, call in calls.items() if call["phase"] == "initial")
+    supplementary = sorted(
+        index for index, call in calls.items() if call["phase"] == "supplementary"
+    )
+    if initial and supplementary and max(initial) > min(supplementary):
+        raise MergeError(
+            "supplementary_round_exceeded",
+            f"Initial call {max(initial)} follows supplementary call {min(supplementary)}; "
+            "the single gap-fill round must come after all initial searches.",
+        )
+    if len(prior_supplementary_sets) > 1 or any(
+        set(supplementary) - prior for prior in prior_supplementary_sets
+    ):
+        raise MergeError(
+            "supplementary_round_exceeded",
+            "A previous merge already contains a gap-fill round; X Research allows "
+            "at most one supplementary round.",
+        )
+    return {
+        "max_searches": MAX_OUTER_SEARCHES,
+        "call_count": len(calls),
+        "initial_call_count": len(initial),
+        "supplementary_call_count": len(supplementary),
+        "supplementary_call_indices": supplementary,
+        "untracked_search_routes": untracked_search_routes,
+    }
+
+
+def _input_route_status(
+    envelopes: list[dict[str, Any]], errors: list[Any]
+) -> tuple[str, int, int]:
+    """Return the merged status and failed/partial counts of the input routes."""
+
+    statuses = [
+        route.get("status")
+        for envelope in envelopes
+        for route in envelope.get("routes", [])
+        if isinstance(route, dict) and route.get("backend") != BACKEND
+    ]
+    failed = statuses.count("failed")
+    partial = statuses.count("partial")
+    if statuses and failed == len(statuses):
+        return "failed", failed, partial
+    if failed or partial or errors:
+        return "partial", failed, partial
+    return "completed", failed, partial
+
+
 def merge_envelopes(
     envelopes: list[dict[str, Any]],
     *,
@@ -812,6 +938,7 @@ def merge_envelopes(
     _validate_merge_arguments(sort=sort, limit=limit, thresholds=thresholds)
     for index, envelope in enumerate(envelopes, start=1):
         validate_envelope(envelope, f"input {index}")
+    search_budget = _call_budget(envelopes)
 
     author_filters = {
         _normalize_author(value)
@@ -888,6 +1015,11 @@ def merge_envelopes(
         "min_replies": 0,
         "min_views": 0,
     }
+    # Filters only reject on known structured values; an absent field is kept
+    # as unknown (Grok candidates never carry language or engagement).
+    unknown_filter_counts = {
+        key: 0 for key in filtered_counts if key not in {"reposts", "replies"}
+    }
     retained: list[dict[str, Any]] = []
     for candidate in candidates:
         if candidate["_merge_repost_state"] is True and not include_reposts:
@@ -897,18 +1029,23 @@ def merge_envelopes(
             filtered_counts["replies"] += 1
             continue
 
+        unknown_fields: list[str] = []
         if author_filters:
             observed = {
                 _normalize_author(value) for value in candidate["_merge_authors"]
             }
-            if not observed.intersection(author_filters):
+            if not observed:
+                unknown_fields.append("author")
+            elif not observed.intersection(author_filters):
                 filtered_counts["author"] += 1
                 continue
         if language_filters:
             observed = {
                 value.casefold() for value in candidate["_merge_languages"]
             }
-            if not observed.intersection(language_filters):
+            if not observed:
+                unknown_fields.append("language")
+            elif not observed.intersection(language_filters):
                 filtered_counts["language"] += 1
                 continue
 
@@ -917,12 +1054,24 @@ def merge_envelopes(
             if threshold is None:
                 continue
             value = _metric(candidate, metric_name)
-            if value is None or value < threshold:
+            if value is None:
+                unknown_fields.append(f"min_{metric_name}")
+            elif value < threshold:
                 filtered_counts[f"min_{metric_name}"] += 1
                 rejected = True
                 break
         if rejected:
             continue
+        if unknown_fields:
+            for field in unknown_fields:
+                unknown_filter_counts[field] += 1
+            _append_limitation(
+                candidate,
+                UNKNOWN_FILTER_LIMITATION.format(fields=", ".join(unknown_fields)),
+            )
+            candidate["platform_fields"]["x_research_merge"]["unverified_filters"] = (
+                unknown_fields
+            )
         retained.append(candidate)
 
     _sort_candidates(retained, sort)
@@ -949,13 +1098,31 @@ def merge_envelopes(
         route_limitations.append(
             f"Engagement sort uses {ENGAGEMENT_FORMULA}; unknown components are treated as zero for ordering only."
         )
+    if any(unknown_filter_counts.values()):
+        route_limitations.append(
+            "Some candidates lacked a field required by an active filter; they were "
+            "retained as unknown rather than verified or filtered."
+        )
+    merge_status, failed_inputs, partial_inputs = _input_route_status(
+        envelopes, merged_errors
+    )
+    if merge_status != "completed":
+        route_limitations.append(
+            f"{failed_inputs} input route(s) failed and {partial_inputs} were partial; "
+            "the merged pool does not cover every planned search."
+        )
+    if search_budget["untracked_search_routes"]:
+        route_limitations.append(
+            f"{search_budget['untracked_search_routes']} Grok input route(s) had no "
+            "call_index and were not counted against the outer-search budget."
+        )
     merged_routes.append(
         {
             "platform": "x",
             "backend": BACKEND,
             "mode": "offline_merge",
             "login_state_used": False,
-            "status": "completed",
+            "status": merge_status,
             "limitations": route_limitations,
         }
     )
@@ -970,6 +1137,10 @@ def merge_envelopes(
             "unknown_repost_status": unknown_repost_count,
             "unknown_reply_status": unknown_reply_count,
             "filtered": filtered_counts,
+            "unknown_filter_fields": unknown_filter_counts,
+            "failed_input_routes": failed_inputs,
+            "partial_input_routes": partial_inputs,
+            "search_budget": search_budget,
             "sort": sort,
             "requested_limit": limit,
             "eligible_before_limit": before_limit,
@@ -1113,7 +1284,7 @@ def main(
         return 2
     json.dump(envelope, stdout, ensure_ascii=False, indent=2)
     stdout.write("\n")
-    return 0
+    return 2 if envelope["routes"][-1]["status"] == "failed" else 0
 
 
 if __name__ == "__main__":

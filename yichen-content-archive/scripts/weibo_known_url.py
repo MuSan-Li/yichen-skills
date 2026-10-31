@@ -13,7 +13,7 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import parse_qs, urlparse
 
 
@@ -31,6 +31,7 @@ SAFE_FORMAT_ID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,80}$")
 YTDLP_SAFETY_FLAGS = (
     "--ignore-config",
     "--no-config-locations",
+    "--no-plugin-dirs",
     "--no-cookies",
     "--no-cookies-from-browser",
     "--no-cache-dir",
@@ -206,7 +207,12 @@ def _format_score(item: Dict[str, Any]) -> tuple:
     )
 
 
-def select_progressive_mp4(info: Dict[str, Any]) -> Dict[str, Any]:
+def _has_codec(item: Dict[str, Any], key: str) -> bool:
+    return item.get(key) not in {None, "none"}
+
+
+def _single_file_mp4s(info: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Directly downloadable (non-segmented) MP4 formats that carry video."""
     candidates: List[Dict[str, Any]] = []
     for item in info.get("formats") or []:
         if not isinstance(item, dict):
@@ -216,13 +222,16 @@ def select_progressive_mp4(info: Dict[str, Any]) -> Dict[str, Any]:
             continue
         if item.get("ext") != "mp4":
             continue
-        if item.get("vcodec") in {None, "none"}:
-            continue
-        if item.get("acodec") in {None, "none"}:
+        if not _has_codec(item, "vcodec"):
             continue
         if item.get("protocol") not in {"http", "https"}:
             continue
         candidates.append(item)
+    return candidates
+
+
+def select_progressive_mp4(info: Dict[str, Any]) -> Dict[str, Any]:
+    candidates = [item for item in _single_file_mp4s(info) if _has_codec(item, "acodec")]
     if not candidates:
         raise ArchiveError(
             "unsupported_media_format",
@@ -231,9 +240,45 @@ def select_progressive_mp4(info: Dict[str, Any]) -> Dict[str, Any]:
     return max(candidates, key=_format_score)
 
 
+def select_single_file_mp4(info: Dict[str, Any]) -> Tuple[Dict[str, Any], str]:
+    """Pick the format to download and say whether it carries an audio track.
+
+    Any format with audio (including audio-only streams) means the post has
+    sound, so only a muxed MP4 is acceptable. Only a post whose formats have no
+    audio at all may fall back to the best video-only MP4 (audio_track: none).
+    """
+    formats = [item for item in info.get("formats") or [] if isinstance(item, dict)]
+    if any(_has_codec(item, "acodec") for item in formats):
+        return select_progressive_mp4(info), "present"
+    candidates = _single_file_mp4s(info)
+    if not candidates:
+        raise ArchiveError(
+            "unsupported_media_format",
+            "未找到可直接下载的单文件 MP4；为避免合并和临时清理，已停止",
+        )
+    return max(candidates, key=_format_score), "none"
+
+
 def sanitized_metadata(
-    info: Dict[str, Any], target: KnownWeiboTarget, selected: Dict[str, Any]
+    info: Dict[str, Any],
+    target: KnownWeiboTarget,
+    selected: Optional[Dict[str, Any]],
+    audio_track: Optional[str] = None,
 ) -> Dict[str, Any]:
+    selected_format = None
+    if selected is not None:
+        selected_format = {
+            "format_id": selected.get("format_id"),
+            "ext": selected.get("ext"),
+            "protocol": selected.get("protocol"),
+            "width": selected.get("width"),
+            "height": selected.get("height"),
+            "fps": selected.get("fps"),
+            "vcodec": selected.get("vcodec"),
+            "acodec": selected.get("acodec"),
+            "filesize": selected.get("filesize"),
+            "filesize_approx": selected.get("filesize_approx"),
+        }
     return {
         "schema_version": "weibo-known-url/v1",
         "platform": "weibo",
@@ -249,18 +294,10 @@ def sanitized_metadata(
         "timestamp": info.get("timestamp"),
         "upload_date": info.get("upload_date"),
         "duration_seconds": info.get("duration"),
-        "selected_format": {
-            "format_id": selected.get("format_id"),
-            "ext": selected.get("ext"),
-            "protocol": selected.get("protocol"),
-            "width": selected.get("width"),
-            "height": selected.get("height"),
-            "fps": selected.get("fps"),
-            "vcodec": selected.get("vcodec"),
-            "acodec": selected.get("acodec"),
-            "filesize": selected.get("filesize"),
-            "filesize_approx": selected.get("filesize_approx"),
-        },
+        "progressive_mp4_available": selected is not None,
+        # "none": no format of the post has audio, so the video-only MP4 was chosen.
+        "audio_track": audio_track if selected is not None else None,
+        "selected_format": selected_format,
     }
 
 
@@ -268,7 +305,8 @@ def choose_unique_run_dir(requested: Path) -> Path:
     requested = requested.expanduser()
     requested.parent.mkdir(parents=True, exist_ok=True)
     candidate = requested
-    counter = 1
+    # Same numbering as the other executors: the first rerun is -run-2.
+    counter = 2
     while candidate.exists() or candidate.is_symlink():
         candidate = requested.with_name(f"{requested.name}-run-{counter}")
         counter += 1
@@ -326,6 +364,13 @@ def probe_media(path: Path) -> Optional[Dict[str, Any]]:
         return json.loads(process.stdout)
     except json.JSONDecodeError:
         return None
+
+
+def audio_stream_count(probe: Optional[Dict[str, Any]]) -> Optional[int]:
+    streams = probe.get("streams") if isinstance(probe, dict) else None
+    if not isinstance(streams, list):
+        return None
+    return sum(1 for stream in streams if isinstance(stream, dict) and stream.get("codec_type") == "audio")
 
 
 def download_media(
@@ -496,24 +541,35 @@ def execute(args: argparse.Namespace) -> Dict[str, Any]:
     try:
         info = fetch_info(target, args.timeout)
         post_id = str(info["id"])
-        selected = select_progressive_mp4(info)
-        metadata = sanitized_metadata(info, target, selected)
+        selected: Optional[Dict[str, Any]] = None
+        audio_track: Optional[str] = None
+        try:
+            selected, audio_track = select_single_file_mp4(info)
+        except ArchiveError as exc:
+            # Read-only info never needs a downloadable single-file MP4.
+            if args.operation == "download" or exc.reason != "unsupported_media_format":
+                raise
+        metadata = sanitized_metadata(info, target, selected, audio_track)
         metadata_path = output_dir / "metadata.json"
         write_json_exclusive(metadata_path, metadata)
 
         verification: Dict[str, Any] = {
             "metadata_sanitized": True,
             "signed_media_url_persisted": False,
+            "audio_track": metadata["audio_track"],
         }
-        if args.operation == "download":
+        if args.operation == "download" and selected is not None:
             media_path = download_media(
                 target, info, selected, output_dir, args.timeout
             )
+            probe = probe_media(media_path)
             verification.update(
                 {
                     "sha256": sha256_file(media_path),
                     "size_bytes": media_path.stat().st_size,
-                    "ffprobe": probe_media(media_path),
+                    "ffprobe": probe,
+                    # Independent check of the format list; null when ffprobe is unavailable.
+                    "ffprobe_audio_streams": audio_stream_count(probe),
                 }
             )
 
@@ -532,6 +588,7 @@ def execute(args: argparse.Namespace) -> Dict[str, Any]:
             "platform": "weibo",
             "operation": args.operation,
             "post_id": post_id,
+            "audio_track": metadata["audio_track"],
             "output_dir": str(output_dir),
             "media_path": str(media_path) if media_path else None,
             "metadata_path": str(metadata_path),

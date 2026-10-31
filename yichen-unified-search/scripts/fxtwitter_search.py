@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import math
+import socket
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -296,7 +298,14 @@ def fetch_search(
             body = response.read(MAX_RESPONSE_BYTES + 1)
     except urllib.error.HTTPError as exc:
         if exc.code == 404:
-            return {"code": 404, "results": [], "cursor": {"top": None, "bottom": None}}
+            # Kept as an empty page so the caller's fallback chain is unchanged,
+            # but marked so it is not mistaken for a verified zero-result search.
+            return {
+                "code": 404,
+                "results": [],
+                "cursor": {"top": None, "bottom": None},
+                "empty_result_signal": "http_404_treated_as_empty",
+            }
         category = {
             400: "invalid_query",
             429: "rate_limited",
@@ -305,8 +314,15 @@ def fetch_search(
             category,
             f"FxTwitter returned HTTP {exc.code}; continue to the configured X fallback chain.",
         ) from exc
-    except (urllib.error.URLError, TimeoutError) as exc:
-        category = "timeout" if isinstance(exc, TimeoutError) else "network_error"
+    except (urllib.error.URLError, http.client.HTTPException, OSError) as exc:
+        # Python 3.9 raises socket.timeout (not TimeoutError) while waiting for
+        # headers or body, and urllib does not wrap it in URLError there.
+        reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+        category = (
+            "timeout"
+            if isinstance(reason, (socket.timeout, TimeoutError))
+            else "network_error"
+        )
         raise SearchError(
             category,
             "FxTwitter could not be reached; continue to the configured X fallback chain.",
@@ -332,6 +348,9 @@ def fetch_search(
             "upstream_api_error",
             f"FxTwitter returned API code {code!r}; continue to the configured X fallback chain.",
         )
+    payload.pop("empty_result_signal", None)
+    if code == 404:
+        payload["empty_result_signal"] = "api_code_404_treated_as_empty"
     return payload
 
 
@@ -384,6 +403,18 @@ def make_envelope(
         route_limitations.append(
             "The time window was enforced locally on records with created_timestamp."
         )
+    empty_result_signal = None
+    if error is None and isinstance(payload, dict) and payload.get("code") == 404:
+        empty_result_signal = (
+            payload.get("empty_result_signal")
+            if payload.get("empty_result_signal")
+            in {"http_404_treated_as_empty", "api_code_404_treated_as_empty"}
+            else "api_code_404_treated_as_empty"
+        )
+        route_limitations.append(
+            f"FxTwitter answered 404 ({empty_result_signal}); it was treated as an empty "
+            "page, which cannot be distinguished from an endpoint change or outage."
+        )
     route_status = "failed" if error else "completed"
     errors = (
         [{"backend": BACKEND, "category": error.category, "message": error.message}]
@@ -419,6 +450,7 @@ def make_envelope(
                 "feed": feed,
                 "truncated": has_more or len(raw_results) >= limit,
                 "time_filter": time_filter,
+                "empty_result_signal": empty_result_signal,
                 "login_state_used": False,
                 "limitations": route_limitations,
             }

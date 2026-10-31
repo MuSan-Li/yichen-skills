@@ -28,6 +28,9 @@ YOUTUBE_HOSTS = {
     "youtu.be",
     "youtube-nocookie.com",
 }
+# Auto-generated lists: RD* mixes/radio, UU*/UL*/PU* channel uploads and
+# popular lists, LL/WL/FL/LM account likes, watch-later and favourites.
+SYSTEM_PLAYLIST_PREFIXES = ("RD", "UU", "UL", "PU", "LL", "WL", "FL", "LM")
 QUALITY_FORMATS = {
     "best": "bestvideo+bestaudio/best",
     "2160p": "bestvideo[height<=2160]+bestaudio/best[height<=2160]",
@@ -45,6 +48,8 @@ class ArchiveError(RuntimeError):
         super().__init__(message)
         self.category = category
         self.message = message
+        # Set once a run directory exists so failure JSON can point at it.
+        self.output_dir: str | None = None
 
 
 def utc_now() -> datetime:
@@ -131,10 +136,28 @@ def require_playlist_url(raw: str) -> tuple[str, str]:
             "playlist_url_required",
             "Playlist enumeration requires an exact YouTube URL containing a valid list= ID.",
         )
+    if playlist_id.startswith(SYSTEM_PLAYLIST_PREFIXES):
+        raise ArchiveError(
+            "system_playlist_unsupported",
+            "Auto-generated playlists (mixes, channel uploads, likes, watch later) are "
+            "recommendation or account views, not exact user playlists; provide a PL/OLAK list.",
+        )
     normalized = urlunparse(
         ("https", "www.youtube.com", "/playlist", "", urlencode({"list": playlist_id}), "")
     )
     return normalized, playlist_id
+
+
+def js_runtime_args() -> list[str]:
+    """--ignore-config drops the local `--js-runtimes node`; re-add it explicitly.
+
+    deno is not installed here, so without this yt-dlp has no JS runtime for
+    YouTube signature/n-challenge solving.
+    """
+    node = shutil.which("node")
+    if not node:
+        return []
+    return ["--js-runtimes", f"node:{node}"]
 
 
 def dependency() -> str:
@@ -217,6 +240,7 @@ def info(args: argparse.Namespace) -> dict[str, Any]:
         dependency(),
         "--ignore-config",
         "--no-plugin-dirs",
+        *js_runtime_args(),
         "--dump-single-json",
         "--skip-download",
         "--no-playlist",
@@ -254,6 +278,7 @@ def download_command(
         binary,
         "--ignore-config",
         "--no-plugin-dirs",
+        *js_runtime_args(),
         "--no-overwrites",
         "--continue",
         "--no-playlist",
@@ -299,8 +324,9 @@ def download(args: argparse.Namespace) -> dict[str, Any]:
     )
     try:
         run(command, timeout=args.timeout)
-    except Exception:
+    except ArchiveError as exc:
         # The exclusive run directory is intentionally preserved for diagnostics.
+        exc.output_dir = str(output_dir)
         raise
     return {
         "status": "success",
@@ -342,6 +368,7 @@ def subtitles(args: argparse.Namespace) -> dict[str, Any]:
         binary,
         "--ignore-config",
         "--no-plugin-dirs",
+        *js_runtime_args(),
         "--no-overwrites",
         "--no-playlist",
         "--write-subs",
@@ -357,14 +384,18 @@ def subtitles(args: argparse.Namespace) -> dict[str, Any]:
         str(output_dir / "%(title).180B [%(id)s].%(ext)s"),
         normalized_url,
     ]
-    run(command, timeout=args.timeout)
-    converted = convert_subtitles(output_dir)
-    srt_files = sorted(output_dir.glob("*.srt"))
-    if not srt_files:
-        raise ArchiveError(
-            "subtitles_unavailable",
-            "No requested public subtitles were available; the run directory was preserved.",
-        )
+    try:
+        run(command, timeout=args.timeout)
+        converted = convert_subtitles(output_dir)
+        srt_files = sorted(output_dir.glob("*.srt"))
+        if not srt_files:
+            raise ArchiveError(
+                "subtitles_unavailable",
+                "No requested public subtitles were available; the run directory was preserved.",
+            )
+    except ArchiveError as exc:
+        exc.output_dir = str(output_dir)
+        raise
     return {
         "status": "success",
         "action": "download_subtitles",
@@ -388,6 +419,7 @@ def playlist(args: argparse.Namespace) -> dict[str, Any]:
         binary,
         "--ignore-config",
         "--no-plugin-dirs",
+        *js_runtime_args(),
         "--flat-playlist",
         "--dump-single-json",
         "--no-warnings",
@@ -397,14 +429,18 @@ def playlist(args: argparse.Namespace) -> dict[str, Any]:
         *auth_args(args.allow_browser_cookies, args.browser),
         normalized_url,
     ]
-    result = run(command, timeout=args.timeout)
     try:
-        payload = json.loads(result.stdout)
-    except json.JSONDecodeError as exc:
-        raise ArchiveError("invalid_response", "yt-dlp returned invalid playlist JSON.") from exc
-    entries = payload.get("entries") if isinstance(payload, dict) else None
-    if not isinstance(entries, list):
-        raise ArchiveError("invalid_response", "Playlist response is missing an entries list.")
+        result = run(command, timeout=args.timeout)
+        try:
+            payload = json.loads(result.stdout)
+        except json.JSONDecodeError as exc:
+            raise ArchiveError("invalid_response", "yt-dlp returned invalid playlist JSON.") from exc
+        entries = payload.get("entries") if isinstance(payload, dict) else None
+        if not isinstance(entries, list):
+            raise ArchiveError("invalid_response", "Playlist response is missing an entries list.")
+    except ArchiveError as exc:
+        exc.output_dir = str(output_dir)
+        raise
 
     normalized_entries = []
     for position, entry in enumerate(entries[: args.limit], 1):
@@ -542,6 +578,8 @@ def main(argv: list[str] | None = None) -> int:
             "backend": "youtube-known-url",
             "error": {"category": exc.category, "message": exc.message},
         }
+        if exc.output_dir:
+            payload["output_dir"] = exc.output_dir
         code = 1
     print(json.dumps(payload, ensure_ascii=False, indent=2))
     return code

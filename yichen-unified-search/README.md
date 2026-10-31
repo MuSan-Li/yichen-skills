@@ -70,7 +70,7 @@ implicit fallback for keyword search.
 |---|---|---|---|---|---|
 | GitHub | Public repositories | `gh search repos --visibility public` | `gh` may use local credentials only to access the public API | 1–50 requested candidates | Raw CLI step |
 | Zhihu | Public keyword results and an explicit hot list | Bundled `zhihu_adapter.py` → separately installed CLI-compatible runtime | Keychain-managed credential; public results are marked `authenticated_public` | Search: 10 per query; batch: 5 queries; hot: 30 | Envelope |
-| WeChat Official Accounts | Cross-account public article candidates | `opencli weixin search` public route | Anonymous | Page 1; 1–50 requested candidates | Raw CLI step |
+| WeChat Official Accounts | Cross-account public article candidates | `opencli weixin search` public route (Sogou, background Browser Bridge tab) | Anonymous | Page 1; at most 10 candidates; results carry temporary Sogou redirect links, so reading an article needs its mp.weixin.qq.com link; pass `--opencli-profile` when several Browser Bridge profiles are connected | Raw CLI step |
 | Weibo | Public keyword post candidates | Bundled `weibo_adapter.py`; anonymous mobile route first, then one access-gate-only OpenCLI fallback | Anonymous first; existing Chrome session only after a qualifying access gate | 3 pages / 20 candidates; batch: 5 serial queries | Envelope |
 | Xiaohongshu | Public note candidates by keyword | `opencli xiaohongshu search` | May reuse an existing Chrome session for this bounded public read-only route | One keyword at a time; 20 candidates; serial with a 5-second gap | Raw CLI step |
 | Douyin | Public video/post candidates by keyword | `opencli douyin search` | May reuse an existing Chrome session for this bounded public read-only route | One keyword at a time; 30 candidates; serial with a 5-second gap | Raw CLI step |
@@ -91,6 +91,8 @@ remain candidate metadata until independently checked.
 - The current native route searches **public repositories only**.
 - The query is placed after `--`, so it cannot be interpreted as another `gh`
   option.
+- The command requests `--json` output that includes each repository `url`;
+  `[]` is a true zero result, while empty or non-JSON output is a failure.
 - The Skill does not claim native code, Issue, or Pull Request object search,
   and it does not clone or modify repositories.
 
@@ -158,7 +160,7 @@ keeps only posts in the tool's structured `matched` time-verification bucket.
 
 | Mode | Best for | Execution model | Stop rule |
 |---|---|---|---|
-| Quick | A small number of focused queries | One outer `search_x_with_grok` call for every supplied query; at most 20 candidates per call | Stop after the supplied queries or on any primary-route failure |
+| Quick | A small number of focused queries | One outer `search_x_with_grok` call for every supplied query, at most 8 distinct queries per plan; at most 20 candidates per call | Stop after the supplied queries or on any primary-route failure |
 | Research | Broader, auditable X coverage | At least three distinct focused queries, gated waves of at most five, offline merge and `tweet_id` deduplication | Target reached, no material gap, no new unique result, one gap-fill round used, 40-call budget reached, or any non-quota primary failure |
 
 The time window is limited to 1–7 days. Repost/reply, author, language,
@@ -269,7 +271,13 @@ python3 "${YICHEN_SKILLS_ROOT:-$HOME/.agents/skills}/yichen-unified-search/scrip
 ```
 
 The planner returns `status`, `authorization`, `steps`, and `limitations`.
-Execute only the emitted steps. Full command contracts are documented in
+Execute only the emitted steps, passing each `argv` array to the process element
+by element rather than joining it into a shell string. Every rejection, including
+a CLI argument error, prints the same `invalid_request` JSON and exits with code 2.
+The CLI accepts `--days` from 0 to 3650 (the widest platform window); each
+platform route narrows it, and routes without a time filter report an unapplied
+window in `limitations`. `--domain`/`--hybrid` require `--platform web`; native
+platforms reject them instead of switching to AnySearch. Full command contracts are documented in
 [`references/routes.md`](references/routes.md).
 
 X plans set `allow_authenticated_fallback=false` by default. If anonymous

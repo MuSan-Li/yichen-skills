@@ -11,10 +11,11 @@ import ipaddress
 import json
 import os
 import posixpath
-import re
+import socket
 import stat
 import sys
 from datetime import datetime, timezone
+from http.client import HTTPException
 from pathlib import Path
 from typing import Any, Callable
 from urllib import error as urllib_error
@@ -54,6 +55,33 @@ class AdapterError(RuntimeError):
         super().__init__(message)
         self.category = category
         self.message = message
+
+
+def _load_public_urls() -> Any:
+    """Load the Skill's shared public-host rule by path, independent of sys.path."""
+
+    module_name = "_yichen_unified_search_public_urls"
+    existing = sys.modules.get(module_name)
+    if existing is not None:
+        return existing
+    spec = importlib.util.spec_from_file_location(
+        module_name, Path(__file__).resolve().with_name("public_urls.py")
+    )
+    if spec is None or spec.loader is None:
+        raise ImportError("public_urls.py could not be loaded")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    sys.modules[module_name] = module
+    return module
+
+
+_PUBLIC_URLS = _load_public_urls()
+PUBLIC_HOST_PROBLEM_MESSAGES = {
+    "malformed": "The URL is malformed.",
+    "non_public": "The URL must identify a public host.",
+    "not_fully_qualified": "The URL host must be a fully qualified public name.",
+    "ambiguous_numeric": "The URL contains an ambiguous numeric host.",
+}
 
 
 def _load_anysearch_adapter() -> Any:
@@ -149,34 +177,14 @@ def validate_public_http_url(value: Any) -> str:
         raise AdapterError("invalid_input", "The URL is malformed.")
 
     host = _normalize_host_uts46(hostname)
-    if not host or len(host) > 253:
-        raise AdapterError("invalid_input", "The URL is malformed.")
-    if host == "localhost" or host.endswith(".localhost") or host.endswith(".local"):
-        raise AdapterError("invalid_input", "The URL must identify a public host.")
-    try:
-        address = ipaddress.ip_address(host)
-    except ValueError:
-        address = None
-    if address is not None and not address.is_global:
-        raise AdapterError("invalid_input", "The URL must identify a public host.")
-    if address is None:
-        if "." not in host:
-            raise AdapterError(
-                "invalid_input", "The URL host must be a fully qualified public name."
-            )
-        labels = host.split(".")
-        if all(re.fullmatch(r"(?:0x[0-9a-f]+|[0-9]+)", label) for label in labels):
-            raise AdapterError(
-                "invalid_input", "The URL contains an ambiguous numeric host."
-            )
-        if any(
-            re.fullmatch(
-                r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label
-            )
-            is None
-            for label in labels
-        ):
-            raise AdapterError("invalid_input", "The URL is malformed.")
+    # Same host rule as AnySearch and the route checks (public_urls.py), including
+    # .internal, .lan, .home and .intranet names.
+    problem = _PUBLIC_URLS.public_host_problem(host)
+    if problem is not None:
+        raise AdapterError(
+            "invalid_input",
+            PUBLIC_HOST_PROBLEM_MESSAGES.get(problem, "The URL must identify a public host."),
+        )
     return cleaned
 
 
@@ -360,7 +368,15 @@ def post_json(endpoint: str, payload: dict[str, Any], api_key: str, timeout: int
         if exc.code == 429:
             raise AdapterError("rate_limited", "Firecrawl quota or rate limit blocked the request.") from None
         raise AdapterError("upstream_error", "Firecrawl returned an unsuccessful HTTP response.") from None
-    except (urllib_error.URLError, TimeoutError, OSError):
+    # Python 3.9: socket.timeout is not a TimeoutError, and a timeout while waiting for
+    # headers or reading the body is not wrapped in URLError.
+    except (TimeoutError, socket.timeout):
+        raise AdapterError("timeout", "Firecrawl did not respond before the timeout.") from None
+    except urllib_error.URLError as exc:
+        if isinstance(exc.reason, (TimeoutError, socket.timeout)):
+            raise AdapterError("timeout", "Firecrawl did not respond before the timeout.") from None
+        raise AdapterError("network_error", "Firecrawl could not be reached.") from None
+    except (OSError, HTTPException):
         raise AdapterError("network_error", "Firecrawl could not be reached.") from None
 
     if not isinstance(status, int) or not 200 <= status < 300:
@@ -535,6 +551,29 @@ def normalize_scrape_response(
     markdown = response["data"].get("markdown")
     if not isinstance(markdown, str) or not markdown.strip():
         raise AdapterError("invalid_response", "Firecrawl Scrape returned no Markdown.")
+    # The same original-content gates as AnySearch verify: a gate
+    # page or a navigation stub is never an opened original.
+    anysearch = _load_anysearch_adapter()
+    metadata = response["data"].get("metadata")
+    metadata = metadata if isinstance(metadata, dict) else {}
+    title = metadata.get("title") if isinstance(metadata.get("title"), str) else ""
+    final_url = metadata.get("url") if isinstance(metadata.get("url"), str) else ""
+    marker = anysearch.blocked_page_marker(
+        markdown, title=title, requested_url=candidate.get("url") or "", final_url=final_url
+    )
+    if marker:
+        raise AdapterError(
+            "blocked_or_verification",
+            f"Firecrawl Scrape returned an anti-bot, verification, or login page "
+            f"(matched {marker!r}); treat the original as unread.",
+        )
+    visible_chars = anysearch.visible_char_count(markdown)
+    if visible_chars < anysearch.MIN_ORIGINAL_CONTENT_CHARS:
+        raise AdapterError(
+            "content_too_short",
+            f"Firecrawl Scrape returned only {visible_chars} visible characters "
+            f"(minimum {anysearch.MIN_ORIGINAL_CONTENT_CHARS}); treat the original as unread.",
+        )
 
     normalized = copy.deepcopy(candidate)
     normalized["verification"] = {

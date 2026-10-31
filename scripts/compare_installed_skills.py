@@ -13,7 +13,6 @@ from pathlib import Path
 
 ALIASES = {
     'yichen-agent-memory': 'agent-memory',
-    'yichen-volc-asr': 'volc-asr',
     'yichen-mac-wechat-dual-open': 'mac-wechat-dual-open',
     'yichen-wechat-local-vault': 'wechat-local-vault',
     'yichen-wecom-local-vault': 'wecom-local-vault',

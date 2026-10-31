@@ -1,4 +1,7 @@
+import contextlib
 import importlib.util
+import io
+import json
 import pathlib
 import sys
 import tempfile
@@ -111,6 +114,98 @@ class YouTubeKnownUrlTests(unittest.TestCase):
             self.assertIn("--no-plugin-dirs", command)
             self.assertNotIn("--write-info-json", command)
             self.assertNotIn("--cookies-from-browser", command)
+
+    def test_system_generated_playlists_are_rejected(self):
+        for url in (
+            "https://www.youtube.com/watch?v=abcdefghijk&list=RDabcdefghijk",
+            "https://www.youtube.com/playlist?list=RDMMabcdefghijk",
+            "https://www.youtube.com/playlist?list=UUabcdefghijklmnopqrstuv",
+            "https://www.youtube.com/playlist?list=ULabcdefghijk",
+            "https://www.youtube.com/playlist?list=LLabcdefghijklmnopqrstuv",
+            "https://www.youtube.com/playlist?list=WLabcdefghijk",
+            "https://www.youtube.com/playlist?list=PUabcdefghijklmnopqrstuv",
+        ):
+            with self.subTest(url=url):
+                with self.assertRaises(YOUTUBE.ArchiveError) as raised:
+                    YOUTUBE.require_playlist_url(url)
+                self.assertEqual(raised.exception.category, "system_playlist_unsupported")
+        for playlist_id in ("PLexample123", "OLAK5uy_example123"):
+            with self.subTest(playlist_id=playlist_id):
+                _, accepted = YOUTUBE.require_playlist_url(
+                    f"https://www.youtube.com/playlist?list={playlist_id}"
+                )
+                self.assertEqual(accepted, playlist_id)
+
+    def test_node_js_runtime_is_passed_explicitly_when_available(self):
+        with mock.patch.object(YOUTUBE.shutil, "which", return_value="/usr/local/bin/node"):
+            self.assertEqual(
+                YOUTUBE.js_runtime_args(), ["--js-runtimes", "node:/usr/local/bin/node"]
+            )
+            command = YOUTUBE.download_command(
+                binary="yt-dlp",
+                url="https://www.youtube.com/watch?v=abcdefghijk",
+                output_dir=pathlib.Path("unused"),
+                quality="best",
+                audio_only=True,
+                allow_browser_cookies=False,
+                browser="chrome",
+            )
+            self.assertIn("node:/usr/local/bin/node", command)
+            self.assertLess(command.index("--ignore-config"), command.index("--js-runtimes"))
+        with mock.patch.object(YOUTUBE.shutil, "which", return_value=None):
+            self.assertEqual(YOUTUBE.js_runtime_args(), [])
+
+    def test_every_operation_includes_js_runtime(self):
+        class Captured(Exception):
+            pass
+
+        calls = []
+
+        def stop(command, **kwargs):
+            calls.append(command)
+            raise Captured()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            args = SimpleNamespace(url="", allow_browser_cookies=False, browser="chrome", timeout=3,
+                output_dir=temp_dir + "/out", langs="en", limit=2, quality="best", audio_only=False)
+            with mock.patch.object(YOUTUBE, "dependency", return_value="yt-dlp"), mock.patch.object(
+                YOUTUBE, "run", side_effect=stop
+            ), mock.patch.object(YOUTUBE.shutil, "which", return_value="/usr/local/bin/node"):
+                for operation in [YOUTUBE.info, YOUTUBE.download, YOUTUBE.subtitles, YOUTUBE.playlist]:
+                    args.url = ("https://www.youtube.com/playlist?list=PLexample123"
+                        if operation is YOUTUBE.playlist else "https://www.youtube.com/watch?v=abcdefghijk")
+                    args.output_dir = f"{temp_dir}/{operation.__name__}"
+                    with self.assertRaises(Captured):
+                        operation(args)
+        self.assertEqual(len(calls), 4)
+        for command in calls:
+            self.assertIn("--js-runtimes", command)
+
+    def test_failed_download_json_reports_preserved_output_dir(self):
+        failure = YOUTUBE.ArchiveError("yt_dlp_failed", "yt-dlp failed with exit code 1")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            for argv in (
+                ["download", "https://www.youtube.com/watch?v=abcdefghijk"],
+                ["subtitles", "https://www.youtube.com/watch?v=abcdefghijk"],
+                ["playlist", "https://www.youtube.com/playlist?list=PLexample123", "--limit", "2"],
+            ):
+                with self.subTest(command=argv[0]):
+                    requested = pathlib.Path(temp_dir) / argv[0]
+                    stdout = io.StringIO()
+                    with mock.patch.object(YOUTUBE, "dependency", return_value="yt-dlp"), mock.patch.object(
+                        YOUTUBE, "run", side_effect=failure
+                    ), contextlib.redirect_stdout(stdout):
+                        code = YOUTUBE.main([*argv, "--output-dir", str(requested)])
+                    payload = json.loads(stdout.getvalue())
+                    self.assertEqual(code, 1)
+                    self.assertEqual(payload["status"], "failed")
+                    self.assertEqual(payload["output_dir"], str(requested.resolve()))
+                    self.assertTrue(pathlib.Path(payload["output_dir"]).is_dir())
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                code = YOUTUBE.main(["info", "https://www.youtube.com/@example"])
+            self.assertEqual(code, 1)
+            self.assertNotIn("output_dir", json.loads(stdout.getvalue()))
 
     def test_browser_cookie_use_requires_explicit_flag(self):
         self.assertEqual(YOUTUBE.auth_args(False, "chrome"), [])

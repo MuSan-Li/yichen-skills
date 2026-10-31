@@ -1,6 +1,8 @@
 import contextlib
+import functools
 import importlib.util
 import io
+import socket
 import json
 import os
 import pathlib
@@ -29,6 +31,7 @@ FIRECRAWL = load_module("firecrawl_adapter", "scripts/firecrawl_adapter.py")
 ANYSEARCH = load_module("firecrawl_test_anysearch", "scripts/anysearch_adapter.py")
 TEST_RECEIPT_SECRET = b"firecrawl-test-receipt-secret-32-bytes-minimum"
 TEST_NOW = datetime(2026, 8, 9, 1, 30, tzinfo=timezone.utc)
+PAGE_MARKDOWN = ("# Page\n\n" + "Body text of the current documentation page. " * 6).strip()
 
 
 def current_candidate():
@@ -252,7 +255,7 @@ class FirecrawlScrapeTests(unittest.TestCase):
 
         def transport(endpoint, payload, api_key, timeout):
             seen.update(endpoint=endpoint, payload=payload, api_key=api_key)
-            return {"success": True, "data": {"markdown": "# Page\n\nBody"}}
+            return {"success": True, "data": {"markdown": PAGE_MARKDOWN}}
 
         with mock.patch.dict(
             os.environ,
@@ -286,7 +289,7 @@ class FirecrawlScrapeTests(unittest.TestCase):
         self.assertEqual(opened["verification"]["status"], "candidate")
         self.assertEqual(
             opened["platform_fields"]["firecrawl"]["scrape_markdown"],
-            "# Page\n\nBody",
+            PAGE_MARKDOWN,
         )
         self.assertEqual(
             opened["provenance"]["verification"]["backend"], "firecrawl"
@@ -358,6 +361,87 @@ class FirecrawlScrapeTests(unittest.TestCase):
                         candidate=candidate,
                         checked_at="2026-08-09T01:30:00Z",
                     )
+
+
+class FirecrawlScrapeGateTests(unittest.TestCase):
+    """Scrape shares the AnySearch original-content gates (review item 14)."""
+
+    def _main(self, markdown, metadata=None):
+        """Run the CLI entry point with an offline transport; return (exit code, envelope)."""
+
+        data = {"markdown": markdown}
+        if metadata is not None:
+            data["metadata"] = metadata
+        transport = mock.Mock(return_value={"success": True, "data": data})
+        offline_execute = functools.partial(
+            FIRECRAWL.execute, transport=transport, receipt_secret=TEST_RECEIPT_SECRET, now=TEST_NOW
+        )
+        stdout = io.StringIO()
+        with mock.patch.object(FIRECRAWL, "load_api_key", return_value="test-key"), \
+                mock.patch.object(FIRECRAWL, "execute", offline_execute), \
+                contextlib.redirect_stdout(stdout):
+            code = FIRECRAWL.main(["scrape", "--candidate-from-search", json.dumps(current_candidate())])
+        transport.assert_called_once()
+        return code, json.loads(stdout.getvalue())
+
+    def test_gate_pages_are_unread_with_exit_code_two(self):
+        cases = (
+            ("# Just a moment...\n\nChecking your browser before accessing example.com.", None),
+            (PAGE_MARKDOWN, {"title": "百度安全验证"}),
+            (PAGE_MARKDOWN, {"title": "Docs", "url": "https://example.com/passport/login?next=/docs"}),
+        )
+        for markdown, metadata in cases:
+            with self.subTest(markdown=markdown[:20], metadata=metadata):
+                code, envelope = self._main(markdown, metadata)
+                self.assertEqual(code, 2)
+                self.assertEqual(envelope["candidates"], [])
+                self.assertEqual(envelope["routes"][0]["status"], "failed")
+                self.assertEqual(envelope["errors"][0]["category"], "blocked_or_verification")
+                self.assertIn("treat the original as unread", envelope["errors"][0]["message"])
+                self.assertNotIn('"opened_original": true', json.dumps(envelope))
+
+    def test_short_or_link_only_pages_are_unread(self):
+        links = "\n".join(
+            f"[{word}](https://example.com/section/{word.lower()}/index-page-with-long-slug)"
+            for word in ("Home", "Docs", "Blog", "Login")
+        )
+        for markdown in ("Sign in", links):
+            with self.subTest(markdown=markdown[:20]):
+                code, envelope = self._main(markdown)
+                self.assertEqual(code, 2)
+                self.assertEqual(envelope["candidates"], [])
+                self.assertEqual(envelope["errors"][0]["category"], "content_too_short")
+
+    def test_substantive_page_is_opened(self):
+        code, envelope = self._main(PAGE_MARKDOWN, {"title": "Docs", "url": "https://example.com/docs/current"})
+        self.assertEqual(code, 0)
+        self.assertTrue(envelope["candidates"][0]["verification"]["opened_original"])
+
+
+class FirecrawlNetworkAndHostTests(unittest.TestCase):
+    def test_socket_timeouts_are_timeouts_not_network_errors(self):
+        for exception, category in (
+            (socket.timeout("timed out"), "timeout"),
+            (urllib_error.URLError(socket.timeout("timed out")), "timeout"),
+            (urllib_error.URLError("name resolution failed"), "network_error"),
+            (ConnectionResetError("reset"), "network_error"),
+            (FIRECRAWL.HTTPException("incomplete read"), "network_error"),
+        ):
+            with self.subTest(exception=type(exception).__name__):
+                with mock.patch.object(FIRECRAWL, "_open_without_redirect", side_effect=exception):
+                    with self.assertRaises(FIRECRAWL.AdapterError) as caught:
+                        FIRECRAWL.post_json(FIRECRAWL.SCRAPE_ENDPOINT, {"url": "https://example.com/"}, "key", 10)
+                self.assertEqual(caught.exception.category, category)
+
+    def test_private_name_suffixes_match_the_shared_rule(self):
+        for url in ("https://a.internal/docs", "https://printer.lan/", "https://nas.home/x",
+                    "https://wiki.intranet/", "https://box.local/", "https://192.168.1.1/"):
+            with self.subTest(url=url):
+                self.assertFalse(FIRECRAWL._PUBLIC_URLS.is_public_http_url(url))
+                with self.assertRaises(FIRECRAWL.AdapterError) as caught:
+                    FIRECRAWL.validate_public_http_url(url)
+                self.assertEqual(caught.exception.category, "invalid_input")
+        self.assertEqual(FIRECRAWL.validate_public_http_url("https://example.com/docs"), "https://example.com/docs")
 
 
 class FirecrawlRuntimeTests(unittest.TestCase):
